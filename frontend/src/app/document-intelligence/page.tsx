@@ -1,3 +1,16 @@
+/**
+ * Invoice Review Queue + Split-Pane Review UI.
+ *
+ * Two views managed by useState<"queue" | "review">:
+ *   Queue:  upload area, invoice table with status badges, export buttons
+ *   Review: left pane (PDF + bounding boxes), right pane (editable field form)
+ *
+ * Processing flow per invoice:
+ *   upload -> ai_parse_document (poll until ready) -> ai_query (extract fields) -> queue
+ *
+ * Field config is fetched from /api/invoice-fields (sourced from invoice_fields.yaml).
+ * All state is local — no external state management.
+ */
 "use client";
 
 import { Button } from "@/components/ui/button";
@@ -17,8 +30,9 @@ import {
   ZoomOut,
   Settings,
   X,
+  Download,
 } from "lucide-react";
-import { apiCall } from "@/lib/api-config";
+import { apiCall, getBaseUrl } from "@/lib/api-config";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -349,6 +363,29 @@ export default function InvoiceProcessingPage() {
   };
 
   // -------------------------------------------------------------------------
+  // Export
+  // -------------------------------------------------------------------------
+
+  const handleExport = async (format: "csv" | "xlsx") => {
+    try {
+      const baseUrl = getBaseUrl();
+      const res = await fetch(`${baseUrl}/api/export-invoices?format=${format}`);
+      if (!res.ok) throw new Error(`Export failed (${res.status})`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `invoices_export.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Export failed:", e);
+    }
+  };
+
+  // -------------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------------
 
@@ -541,6 +578,16 @@ export default function InvoiceProcessingPage() {
                 </span>
               )}
             </div>
+            {confirmedCount > 0 && (
+              <>
+                <Button variant="outline" size="sm" onClick={() => handleExport("xlsx")}>
+                  <Download className="h-4 w-4 mr-1" /> Excel
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => handleExport("csv")}>
+                  <Download className="h-4 w-4 mr-1" /> CSV
+                </Button>
+              </>
+            )}
             <Button variant="ghost" size="sm" onClick={() => setShowSettings(!showSettings)}>
               <Settings className="h-4 w-4" />
             </Button>
@@ -611,9 +658,12 @@ export default function InvoiceProcessingPage() {
                           <StatusBadge status={inv.status} />
                         </td>
                         <td className="py-3 text-gray-500">
-                          {inv.extracted_fields
-                            ? `${Object.values(inv.extracted_fields).filter((v) => v !== null && v !== "").length}/${fieldConfig.length}`
-                            : "-"}
+                          {(() => {
+                            const fields = inv.confirmed_fields ?? inv.extracted_fields;
+                            return fields
+                              ? `${Object.values(fields).filter((v) => v !== null && v !== "").length}/${fieldConfig.length}`
+                              : "-";
+                          })()}
                         </td>
                         <td className="py-3 text-right">
                           {["extracted", "confirmed"].includes(inv.status) && (

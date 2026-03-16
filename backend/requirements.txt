@@ -7,3 +7,4 @@ python-multipart
 PyYAML
 PyPDF2
 Pillow
+openpyxl

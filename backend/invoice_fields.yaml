@@ -1,3 +1,14 @@
+# Invoice field definitions — edit this file to customize what gets extracted.
+#
+# Each field has:
+#   name:        Key used in JSON output and Delta table (no spaces, lowercase)
+#   label:       Display name shown in the review UI
+#   description: Injected into the LLM prompt — be specific to improve accuracy
+#   type:        string | date | currency (affects UI input type)
+#
+# To add a field: append a new entry below and redeploy (or POST /api/reload-invoice-fields).
+# To remove a field: delete the entry. Existing confirmed data is not affected (stored as JSON).
+
 fields:
   - name: invoice_number
     label: Invoice Number

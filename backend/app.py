@@ -1,4 +1,21 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File as FastAPIFile
+"""
+Invoice Processing API — Databricks App backend.
+
+Endpoints handle the full invoice lifecycle:
+  Upload PDF -> ai_parse_document (layout) -> ai_query (field extraction) -> human review -> confirm to Delta
+
+Configuration:
+  - app.yaml: env vars for warehouse, volume, table paths, model endpoint
+  - invoice_fields.yaml: defines what fields to extract (name, label, description, type)
+    The 'description' field is injected into the LLM prompt — more specific = better accuracy.
+
+Key dependencies:
+  - Databricks SDK (WorkspaceClient) for file operations and SQL execution
+  - ai_parse_document: extracts layout elements with bounding boxes from PDFs
+  - ai_query: sends document text + field prompts to a Foundation Model endpoint
+"""
+
+from fastapi import FastAPI, HTTPException, UploadFile, File as FastAPIFile, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -17,6 +34,7 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 import io
 import re
+import csv
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -214,31 +232,38 @@ async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
             except Exception:
                 pass  # Already exists
 
+        # List existing files once — track names across uploads in this batch
+        existing_names = set()
+        try:
+            for entry in w.files.list_directory_contents(directory_path=base_path):
+                if entry.name:
+                    existing_names.add(entry.name)
+        except Exception as e:
+            print(f"Could not list directory contents: {e}")
+
         for file in files:
             with tempfile.NamedTemporaryFile(delete=False) as temp_file:
                 shutil.copyfileobj(file.file, temp_file)
                 temp_file_path = temp_file.name
 
             try:
-                uc_file_path = f"{base_path}/{file.filename}"
+                original_name = file.filename
+                stem, suffix = os.path.splitext(original_name)
 
-                # Clean up any existing file/directory at that path
-                try:
-                    w.files.delete(file_path=uc_file_path, recursive=True)
-                except Exception:
-                    pass
-                try:
-                    w.files.delete(file_path=uc_file_path)
-                except Exception:
-                    pass
+                final_name = original_name
+                counter = 1
+                while final_name in existing_names:
+                    final_name = f"{stem}_{counter}{suffix}"
+                    counter += 1
 
-                time.sleep(0.5)
+                uc_file_path = f"{base_path}/{final_name}"
+                existing_names.add(final_name)
 
                 with open(temp_file_path, 'rb') as f:
-                    w.files.upload(file_path=uc_file_path, contents=f, overwrite=True)
+                    w.files.upload(file_path=uc_file_path, contents=f, overwrite=False)
 
                 file_size = os.path.getsize(temp_file_path)
-                uploaded_files.append({"name": file.filename, "path": uc_file_path, "size": file_size})
+                uploaded_files.append({"name": final_name, "path": uc_file_path, "size": file_size})
             finally:
                 os.unlink(temp_file_path)
 
@@ -894,6 +919,139 @@ def confirm_invoice(request: ConfirmInvoiceRequest):
         return {"success": True, "file_path": request.file_path, "message": "Invoice confirmed"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to confirm invoice: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Export Invoices (CSV / Excel)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/export-invoices")
+def export_invoices(export_format: str = Query("csv", alias="format")):
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+
+    if export_format not in ("csv", "xlsx"):
+        raise HTTPException(status_code=400, detail="Format must be 'csv' or 'xlsx'")
+
+    try:
+        results_table = get_invoice_results_table()
+        result = w.statement_execution.execute_statement(
+            statement=f"""
+            SELECT file_path, filename, status, extracted_fields, confirmed_fields,
+                   uploaded_at, confirmed_at
+            FROM IDENTIFIER('{results_table}')
+            ORDER BY confirmed_at DESC NULLS LAST, uploaded_at DESC
+            """,
+            warehouse_id=current_warehouse_id,
+            wait_timeout='30s'
+        )
+
+        rows = []
+        if result.result and result.result.data_array:
+            for row in result.result.data_array:
+                # Use confirmed_fields if available, else extracted_fields
+                fields = {}
+                try:
+                    if row[4]:
+                        fields = json.loads(row[4])
+                    elif row[3]:
+                        fields = json.loads(row[3])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                rows.append({
+                    "filename": row[1],
+                    "status": row[2],
+                    **{f['name']: fields.get(f['name'], '') for f in INVOICE_FIELDS},
+                    "uploaded_at": row[5] or '',
+                    "confirmed_at": row[6] or '',
+                })
+
+        # Build column headers
+        columns = ["filename", "status"] + [f['label'] for f in INVOICE_FIELDS] + ["uploaded_at", "confirmed_at"]
+        data_keys = ["filename", "status"] + [f['name'] for f in INVOICE_FIELDS] + ["uploaded_at", "confirmed_at"]
+
+        if export_format == "csv":
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            for r in rows:
+                writer.writerow([r.get(k, '') for k in data_keys])
+
+            return Response(
+                content=output.getvalue(),
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=invoices_export.csv"}
+            )
+
+        else:  # xlsx
+            try:
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            except ImportError:
+                raise HTTPException(status_code=500, detail="openpyxl not installed — cannot generate Excel")
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Invoice Export"
+
+            # Header style
+            header_font = Font(bold=True, color="FFFFFF", size=11)
+            header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+            thin_border = Border(
+                left=Side(style='thin', color='D0D0D0'),
+                right=Side(style='thin', color='D0D0D0'),
+                top=Side(style='thin', color='D0D0D0'),
+                bottom=Side(style='thin', color='D0D0D0'),
+            )
+
+            # Write headers
+            for col_idx, header in enumerate(columns, 1):
+                cell = ws.cell(row=1, column=col_idx, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal='center')
+                cell.border = thin_border
+
+            # Write data
+            status_fills = {
+                'confirmed': PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"),
+                'extracted': PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),
+            }
+            for row_idx, r in enumerate(rows, 2):
+                for col_idx, key in enumerate(data_keys, 1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=r.get(key, ''))
+                    cell.border = thin_border
+                    if key == 'status' and r.get('status') in status_fills:
+                        cell.fill = status_fills[r['status']]
+
+            # Auto-fit column widths
+            for col_idx, key in enumerate(data_keys, 1):
+                max_len = len(columns[col_idx - 1])
+                for r in rows:
+                    val = str(r.get(key, ''))
+                    if len(val) > max_len:
+                        max_len = len(val)
+                ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 40)
+
+            # Freeze header row
+            ws.freeze_panes = 'A2'
+
+            buffer = io.BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
+
+            return Response(
+                content=buffer.getvalue(),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=invoices_export.xlsx"}
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
