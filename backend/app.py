@@ -648,29 +648,29 @@ def extract_fields(request: ExtractFieldsRequest):
         file_path = request.file_path
         dbfs_path = f"dbfs:{file_path}" if file_path.startswith('/Volumes/') else file_path
 
-        # Build the field descriptions for the prompt
-        field_descriptions = "\n".join([
-            f"- {f['name']}: {f['description']}"
-            for f in INVOICE_FIELDS
-        ])
+        # Build the field descriptions for the prompt — use \n literals for SQL
+        field_lines = []
+        for f in INVOICE_FIELDS:
+            desc = f['description'].replace("'", "''")
+            field_lines.append(f"- {f['name']}: {desc}")
+        field_descriptions_escaped = "\\n".join(field_lines)
 
-        field_names = ", ".join([f'"{f["name"]}"' for f in INVOICE_FIELDS])
+        field_names_escaped = ", ".join([f['name'] for f in INVOICE_FIELDS])
 
-        # Build the extraction prompt
-        prompt = f"""You are extracting structured data from an invoice document. Extract ONLY the following fields from the document text below. Return a JSON object with exactly these keys. If a value cannot be found, use null.
+        # Build prompt as a SQL-safe string (single quotes doubled, newlines as \n literals)
+        prompt_sql = (
+            "You are extracting structured data from an invoice document. "
+            "Extract ONLY the following fields from the document text below. "
+            "Return a JSON object with exactly these keys. If a value cannot be found, use null.\\n\\n"
+            f"Fields to extract:\\n{field_descriptions_escaped}\\n\\n"
+            "IMPORTANT:\\n"
+            "- Return ONLY a valid JSON object, no other text or markdown.\\n"
+            f"- Use the exact field names as keys: {field_names_escaped}\\n"
+            "- For dates, use YYYY-MM-DD format when possible.\\n"
+            "- For currency amounts, return just the number (e.g. 1234.56 not $1,234.56).\\n\\n"
+            "Document text:\\n"
+        )
 
-Fields to extract:
-{field_descriptions}
-
-IMPORTANT:
-- Return ONLY a valid JSON object, no other text or markdown.
-- Use the exact field names as keys: {field_names}
-- For dates, use YYYY-MM-DD format when possible.
-- For currency amounts, return just the number (e.g. "1234.56" not "$1,234.56").
-"""
-
-        # Use ai_query to extract fields from the parsed document content
-        # We concatenate all text content from the parsed elements
         extract_query = f"""
         WITH doc_content AS (
             SELECT concat_ws('\\n', collect_list(content)) as full_text
@@ -681,14 +681,17 @@ IMPORTANT:
         )
         SELECT ai_query(
             '{ai_query_model}',
-            concat('{prompt.replace(chr(39), chr(39)+chr(39))}', '\\n\\nDocument text:\\n', full_text)
+            concat('{prompt_sql}', full_text)
         ) as extracted
         FROM doc_content
         WHERE full_text IS NOT NULL
         """
 
         print(f"Extracting fields for {file_path} using {ai_query_model}")
+        print(f"Extract query (first 500 chars): {extract_query[:500]}")
         result = execute_sql(extract_query)
+
+        print(f"Extract result status: {result.status}")
 
         if result.status and result.status.state == StatementState.SUCCEEDED:
             if result.result and result.result.data_array and len(result.result.data_array) > 0:
@@ -712,16 +715,29 @@ IMPORTANT:
                     "success": False,
                     "file_path": file_path,
                     "fields": {f['name']: None for f in INVOICE_FIELDS},
-                    "error": "Could not parse AI response"
+                    "error": f"Could not parse AI response: {raw_response[:200] if raw_response else 'empty'}"
+                }
+            else:
+                print("Extract query succeeded but no data returned")
+                return {
+                    "success": False,
+                    "file_path": file_path,
+                    "fields": {f['name']: None for f in INVOICE_FIELDS},
+                    "error": "No document content found to extract from"
                 }
 
         error_msg = "Extraction query failed"
-        if result.status and result.status.error:
-            error_msg += f": {result.status.error}"
+        if result.status:
+            error_msg += f" (state={result.status.state})"
+            if result.status.error:
+                error_msg += f": {result.status.error}"
+        print(f"Extract fields error: {error_msg}")
         return {"success": False, "file_path": file_path, "fields": {f['name']: None for f in INVOICE_FIELDS}, "error": error_msg}
 
     except Exception as e:
-        print(f"Field extraction error: {e}")
+        print(f"Field extraction exception: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "file_path": request.file_path,
@@ -760,7 +776,10 @@ def _save_invoice_result(file_path: str, fields: dict, status: str = 'extracted'
     try:
         results_table = get_invoice_results_table()
         filename = file_path.split('/')[-1]
-        fields_json = json.dumps(fields).replace("'", "''")
+        # Double-escape for SQL: replace \ with \\, then ' with ''
+        fields_json = json.dumps(fields).replace("\\", "\\\\").replace("'", "\\'")
+        file_path_escaped = file_path.replace("'", "\\'")
+        filename_escaped = filename.replace("'", "\\'")
 
         # Ensure table exists
         execute_sql(f"""
@@ -775,42 +794,27 @@ def _save_invoice_result(file_path: str, fields: dict, status: str = 'extracted'
         ) USING DELTA
         """, '30s')
 
-        # Check if record exists
-        check = w.statement_execution.execute_statement(
-            statement=f"SELECT COUNT(*) FROM IDENTIFIER('{results_table}') WHERE file_path = '{file_path}'",
-            warehouse_id=current_warehouse_id,
-            wait_timeout='30s'
-        )
+        # Upsert: delete then insert (simpler than UPDATE for Databricks SQL)
+        execute_sql(f"DELETE FROM IDENTIFIER('{results_table}') WHERE file_path = '{file_path_escaped}'", '30s')
 
-        exists = False
-        if check.result and check.result.data_array:
-            exists = int(check.result.data_array[0][0] or 0) > 0
-
-        if exists:
-            if status == 'confirmed':
-                execute_sql(f"""
-                UPDATE IDENTIFIER('{results_table}')
-                SET status = '{status}', confirmed_fields = '{fields_json}', confirmed_at = current_timestamp()
-                WHERE file_path = '{file_path}'
-                """, '30s')
-            else:
-                execute_sql(f"""
-                UPDATE IDENTIFIER('{results_table}')
-                SET status = '{status}', extracted_fields = '{fields_json}'
-                WHERE file_path = '{file_path}'
-                """, '30s')
-        else:
-            col = 'extracted_fields' if status == 'extracted' else 'confirmed_fields'
-            ts_col = 'uploaded_at' if status == 'extracted' else 'confirmed_at'
+        if status == 'confirmed':
             execute_sql(f"""
             INSERT INTO IDENTIFIER('{results_table}')
-            (file_path, filename, status, {col}, {ts_col})
-            VALUES ('{file_path}', '{filename}', '{status}', '{fields_json}', current_timestamp())
+            (file_path, filename, status, confirmed_fields, confirmed_at)
+            VALUES ('{file_path_escaped}', '{filename_escaped}', '{status}', '{fields_json}', current_timestamp())
+            """, '30s')
+        else:
+            execute_sql(f"""
+            INSERT INTO IDENTIFIER('{results_table}')
+            (file_path, filename, status, extracted_fields, uploaded_at)
+            VALUES ('{file_path_escaped}', '{filename_escaped}', '{status}', '{fields_json}', current_timestamp())
             """, '30s')
 
         print(f"Saved invoice result: {file_path} ({status})")
     except Exception as e:
         print(f"Error saving invoice result: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------

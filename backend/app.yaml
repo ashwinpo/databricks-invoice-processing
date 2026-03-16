@@ -21,5 +21,5 @@ env:
 - name: INVOICE_RESULTS_TABLE
   value: main.ai_parse_document_demo.ashwin_invoice_results
 - name: AI_QUERY_MODEL
-  value: databricks-claude-sonnet-4-20250514
+  value: databricks-claude-sonnet-4-6
 runtime: python_3.10

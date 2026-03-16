@@ -198,10 +198,18 @@ export default function InvoiceProcessingPage() {
           )
         );
       } else {
+        // Extraction failed but document is parsed — still let user review manually
+        const errorDetail = extractRes.error || "Field extraction failed";
+        console.error("Extract fields error:", errorDetail);
         setInvoices((prev) =>
           prev.map((inv) =>
             inv.file_path === ucPath
-              ? { ...inv, status: "extracted", extracted_fields: extractRes.fields || {} }
+              ? {
+                  ...inv,
+                  status: "extracted",
+                  extracted_fields: extractRes.fields || {},
+                  error: errorDetail,
+                }
               : inv
           )
         );
