@@ -4,12 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.files import FileInfo
 from databricks.sdk.service.sql import StatementState
 import os
 import yaml
+import json
 from dotenv import load_dotenv
-from typing import List
+from typing import List, Optional
 import tempfile
 import shutil
 import base64
@@ -18,12 +18,14 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import re
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 def load_yaml_config():
-    """Load configuration from app.yaml file"""
     try:
         with open('app.yaml', 'r') as file:
             config = yaml.safe_load(file)
-            # Convert env array to a dictionary for easy access
             yaml_config = {}
             if 'env' in config:
                 for env_var in config['env']:
@@ -33,14 +35,24 @@ def load_yaml_config():
         print(f"Warning: Could not load app.yaml config: {e}")
         return {}
 
-# Load YAML configuration
+
+def load_invoice_fields():
+    try:
+        with open('invoice_fields.yaml', 'r') as f:
+            config = yaml.safe_load(f)
+            return config.get('fields', [])
+    except Exception as e:
+        print(f"Warning: Could not load invoice_fields.yaml: {e}")
+        return []
+
+
 YAML_CONFIG = load_yaml_config()
+INVOICE_FIELDS = load_invoice_fields()
 
 load_dotenv()
 
 app = FastAPI()
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,45 +61,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
 # Pydantic models
+# ---------------------------------------------------------------------------
+
 class WriteToTableRequest(BaseModel):
     file_paths: List[str]
     limit: int = 10
-    operation_mode: str = 'append'  # 'replace' or 'append'
+    operation_mode: str = 'append'
 
 class QueryDeltaTableRequest(BaseModel):
     file_paths: List[str] = []
     limit: int = 10
-    page_number: int = None  # Optional: filter by specific page number
+    page_number: Optional[int] = None
 
-# Helper functions
-def get_uc_volume_path() -> str:
-    """Get the current UC Volume path"""
-    return current_volume_path or "/Volumes/main/default/ai_functions_demo"
+class VisualizePageRequest(BaseModel):
+    file_path: Optional[str] = None
+    page_number: Optional[int] = None
 
-def get_delta_table_path() -> str:
-    """Get the current Delta table path"""  
-    return current_delta_table_path or "main.default.ai_functions_demo_documents"
-
-# Initialize Databricks client - uses automatic authentication in Databricks Apps
-try:
-    w = WorkspaceClient()  # Automatic authentication
-    warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", YAML_CONFIG.get("DATABRICKS_WAREHOUSE_ID"))
-    print(f"✅ Databricks client initialized with warehouse: {warehouse_id}")
-except Exception as e:
-    print(f"⚠️ Databricks client initialization failed: {e}")
-    w = None
-    warehouse_id = None
-
-# Global variables to store dynamic configuration
-current_warehouse_id = warehouse_id
-current_volume_path = os.getenv("DATABRICKS_VOLUME_PATH", YAML_CONFIG.get("DATABRICKS_VOLUME_PATH"))
-current_delta_table_path = os.getenv("DATABRICKS_DELTA_TABLE_PATH", YAML_CONFIG.get("DATABRICKS_DELTA_TABLE_PATH"))
-
-# Batch job configuration
-batch_job_id = None  # Will be set when user configures it or looked up by job name
-batch_job_name = os.getenv("BATCH_JOB_NAME", YAML_CONFIG.get("BATCH_JOB_NAME"))
-batch_input_volume_path = os.getenv("BATCH_INPUT_VOLUME_PATH", YAML_CONFIG.get("BATCH_INPUT_VOLUME_PATH"))
+class PageMetadataRequest(BaseModel):
+    file_paths: List[str] = []
 
 class WarehouseConfigRequest(BaseModel):
     warehouse_id: str
@@ -98,18 +91,69 @@ class VolumePathConfigRequest(BaseModel):
 class DeltaTablePathConfigRequest(BaseModel):
     delta_table_path: str
 
-class VisualizePageRequest(BaseModel):
-    file_path: str = None
-    page_number: int = None  # Optional: visualize specific page only
+class ExtractFieldsRequest(BaseModel):
+    file_path: str
 
-class PageMetadataRequest(BaseModel):
-    file_paths: List[str] = []
+class ConfirmInvoiceRequest(BaseModel):
+    file_path: str
+    fields: dict
+
+# ---------------------------------------------------------------------------
+# Databricks client init
+# ---------------------------------------------------------------------------
+
+try:
+    w = WorkspaceClient()
+    warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", YAML_CONFIG.get("DATABRICKS_WAREHOUSE_ID"))
+    print(f"Databricks client initialized with warehouse: {warehouse_id}")
+except Exception as e:
+    print(f"Databricks client initialization failed: {e}")
+    w = None
+    warehouse_id = None
+
+current_warehouse_id = warehouse_id
+current_volume_path = os.getenv("DATABRICKS_VOLUME_PATH", YAML_CONFIG.get("DATABRICKS_VOLUME_PATH"))
+current_delta_table_path = os.getenv("DATABRICKS_DELTA_TABLE_PATH", YAML_CONFIG.get("DATABRICKS_DELTA_TABLE_PATH"))
+invoice_results_table = os.getenv("INVOICE_RESULTS_TABLE", YAML_CONFIG.get("INVOICE_RESULTS_TABLE"))
+ai_query_model = os.getenv("AI_QUERY_MODEL", YAML_CONFIG.get("AI_QUERY_MODEL", "databricks-claude-sonnet-4-20250514"))
 
 
+def get_uc_volume_path() -> str:
+    return current_volume_path or "/Volumes/main/default/ai_functions_demo"
+
+def get_delta_table_path() -> str:
+    return current_delta_table_path or "main.default.ai_functions_demo_documents"
+
+def get_invoice_results_table() -> str:
+    return invoice_results_table or "main.ai_parse_document_demo.ashwin_invoice_results"
+
+# ---------------------------------------------------------------------------
+# Helper: execute SQL and wait
+# ---------------------------------------------------------------------------
+
+def execute_sql(statement: str, wait_timeout: str = '50s'):
+    result = w.statement_execution.execute_statement(
+        statement=statement,
+        warehouse_id=current_warehouse_id,
+        wait_timeout=wait_timeout
+    )
+    if result.status and result.status.state in [StatementState.PENDING, StatementState.RUNNING]:
+        max_wait = 600
+        waited = 0
+        while result.status.state in [StatementState.PENDING, StatementState.RUNNING] and waited < max_wait:
+            time.sleep(5)
+            waited += 5
+            result = w.statement_execution.get_statement(result.statement_id)
+            print(f"Waiting for SQL completion... ({waited}s) - Status: {result.status.state}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Config endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/api/warehouse-config")
 def get_warehouse_config():
-    """Get current warehouse configuration"""
     return {
         "warehouse_id": current_warehouse_id,
         "default_warehouse_id": warehouse_id
@@ -117,20 +161,13 @@ def get_warehouse_config():
 
 @app.post("/api/warehouse-config")
 def update_warehouse_config(request: WarehouseConfigRequest):
-    """Update warehouse configuration"""
     global current_warehouse_id
     current_warehouse_id = request.warehouse_id
-    print(f"🔧 Warehouse ID updated to: {current_warehouse_id}")
-    return {
-        "success": True,
-        "warehouse_id": current_warehouse_id,
-        "message": "Warehouse ID updated successfully"
-    }
+    return {"success": True, "warehouse_id": current_warehouse_id, "message": "Warehouse ID updated"}
 
 @app.get("/api/volume-path-config")
 def get_volume_path_config():
-    """Get current volume path configuration"""
-    default_path = YAML_CONFIG.get("DATABRICKS_VOLUME_PATH", "/Volumes/fins_genai/unstructured_documents/pdf_tpg/")
+    default_path = YAML_CONFIG.get("DATABRICKS_VOLUME_PATH", "/Volumes/main/default/invoices/")
     return {
         "volume_path": current_volume_path or default_path,
         "default_volume_path": default_path
@@ -138,20 +175,13 @@ def get_volume_path_config():
 
 @app.post("/api/volume-path-config")
 def update_volume_path_config(request: VolumePathConfigRequest):
-    """Update volume path configuration"""
     global current_volume_path
     current_volume_path = request.volume_path
-    print(f"🔧 Volume path updated to: {current_volume_path}")
-    return {
-        "success": True,
-        "volume_path": current_volume_path,
-        "message": "Volume path updated successfully"
-    }
+    return {"success": True, "volume_path": current_volume_path, "message": "Volume path updated"}
 
 @app.get("/api/delta-table-path-config")
 def get_delta_table_path_config():
-    """Get current delta table path configuration"""
-    default_path = YAML_CONFIG.get("DATABRICKS_DELTA_TABLE_PATH", "/fins_genai.unstructured_documents.files_parsed")
+    default_path = YAML_CONFIG.get("DATABRICKS_DELTA_TABLE_PATH", "main.default.documents")
     return {
         "delta_table_path": current_delta_table_path or default_path,
         "default_delta_table_path": default_path
@@ -159,752 +189,117 @@ def get_delta_table_path_config():
 
 @app.post("/api/delta-table-path-config")
 def update_delta_table_path_config(request: DeltaTablePathConfigRequest):
-    """Update delta table path configuration"""
     global current_delta_table_path
     current_delta_table_path = request.delta_table_path
-    print(f"🔧 Delta table path updated to: {current_delta_table_path}")
-    return {
-        "success": True,
-        "delta_table_path": current_delta_table_path,
-        "message": "Delta table path updated successfully"
-    }
+    return {"success": True, "delta_table_path": current_delta_table_path, "message": "Delta table path updated"}
 
 
-# ============================================================================
-# BATCH JOB APIs
-# ============================================================================
-
-@app.get("/api/batch-job-config")
-def get_batch_job_config():
-    """Get batch job configuration - tries to find job by configured job_id or by job name"""
-    global batch_job_id
-
-    print(f"🔵 DEBUG: get_batch_job_config called - batch_job_id={batch_job_id}, batch_job_name={batch_job_name}")
-
-    if not w:
-        return {
-            "success": False,
-            "job_deployed": False,
-            "error": "Databricks connection not configured"
-        }
-
-    try:
-        job = None
-        job_id_to_use = batch_job_id
-
-        # If we have a batch_job_id, try to get the job directly
-        if batch_job_id:
-            try:
-                job = w.jobs.get(job_id=int(batch_job_id))
-            except Exception as e:
-                print(f"⚠️ Job ID {batch_job_id} not found: {e}")
-                batch_job_id = None  # Reset if invalid
-
-        # If no job_id or it was invalid, try to find by name
-        if not job and batch_job_name:
-            print(f"🔍 Searching for job with name containing: {batch_job_name}")
-            jobs_list = list(w.jobs.list(name=batch_job_name))
-
-            if jobs_list:
-                # Find exact match or match with [dev username] prefix
-                for j in jobs_list:
-                    if j.settings and j.settings.name:
-                        # Match exact name or name with dev prefix like "[dev q_yu] ai_parse_document_app_workflow"
-                        if (j.settings.name == batch_job_name or
-                            j.settings.name.endswith(batch_job_name)):
-                            job = j
-                            job_id_to_use = str(j.job_id)
-                            batch_job_id = job_id_to_use  # Cache for future requests
-                            print(f"✅ Found job: {j.settings.name} (ID: {j.job_id})")
-                            break
-
-        if job:
-            response = {
-                "success": True,
-                "job_deployed": True,
-                "job_id": job_id_to_use,
-                "job_name": job.settings.name if job.settings else None,
-                "input_volume_path": batch_input_volume_path,
-                "message": f"Batch job '{job.settings.name}' is ready"
-            }
-            print(f"🔵 DEBUG: Returning job found response: {response}")
-            return response
-        else:
-            # No job found
-            if not batch_job_name:
-                message = "No batch job configured. Please deploy the asset bundle and configure the job ID."
-            else:
-                message = f"Job '{batch_job_name}' not found. Please deploy the asset bundle first."
-
-            return {
-                "success": False,
-                "job_deployed": False,
-                "job_name": batch_job_name,
-                "input_volume_path": batch_input_volume_path,
-                "message": message
-            }
-    except Exception as e:
-        print(f"❌ Error in get_batch_job_config: {str(e)}")
-        return {
-            "success": False,
-            "job_deployed": False,
-            "job_name": batch_job_name,
-            "error": str(e),
-            "message": "Error checking job configuration"
-        }
-
-
-@app.post("/api/clean-batch-input-path")
-async def clean_batch_input_path():
-    """Clean all files from batch input volume path before new upload"""
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection not configured")
-
-    if not batch_input_volume_path:
-        raise HTTPException(status_code=500, detail="BATCH_INPUT_VOLUME_PATH not configured")
-
-    try:
-        base_path = batch_input_volume_path.rstrip('/')
-
-        # Check if directory exists
-        try:
-            files_in_dir = w.files.list_directory_contents(base_path)
-
-            # Delete all files in the directory
-            deleted_count = 0
-            for file_info in files_in_dir:
-                try:
-                    w.files.delete(file_info.path)
-                    deleted_count += 1
-                    print(f"🗑️  Deleted: {file_info.path}")
-                except Exception as e:
-                    print(f"⚠️  Failed to delete {file_info.path}: {str(e)}")
-
-            return {
-                "success": True,
-                "message": f"Cleaned batch input path: {base_path}",
-                "deleted_count": deleted_count
-            }
-        except Exception as e:
-            # Directory doesn't exist or is already empty
-            if "does not exist" in str(e).lower() or "not found" in str(e).lower():
-                return {
-                    "success": True,
-                    "message": f"Batch input path is empty or doesn't exist: {base_path}",
-                    "deleted_count": 0
-                }
-            raise
-
-    except Exception as e:
-        print(f"❌ Error cleaning batch input path: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to clean batch input path: {str(e)}")
-
-
-@app.post("/api/upload-batch-pdfs")
-async def upload_batch_pdfs(files: List[UploadFile] = FastAPIFile(...)):
-    """Upload multiple PDF files to batch input volume"""
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection not configured")
-
-    if not batch_input_volume_path:
-        raise HTTPException(status_code=500, detail="BATCH_INPUT_VOLUME_PATH not configured")
-
-    try:
-        uploaded_files = []
-        base_path = batch_input_volume_path.rstrip('/')
-
-        # Ensure input directory exists
-        try:
-            w.files.list_directory_contents(base_path)
-        except Exception:
-            # Directory doesn't exist, try to create it
-            print(f"📁 Creating batch input directory: {base_path}")
-            # Note: UC Volumes directories are created automatically on first file upload
-
-        for file in files:
-            if not file.filename.lower().endswith('.pdf'):
-                print(f"⚠️ Skipping non-PDF file: {file.filename}")
-                continue
-
-            # Read file content
-            content = await file.read()
-
-            # Construct full UC path
-            file_path = f"{base_path}/{file.filename}"
-
-            # Upload to UC Volume using Files API
-            w.files.upload(
-                file_path=file_path,
-                contents=io.BytesIO(content),
-                overwrite=True
-            )
-
-            uploaded_files.append({
-                "filename": file.filename,
-                "path": file_path,
-                "size": len(content)
-            })
-
-            print(f"✅ Uploaded batch PDF: {file_path}")
-
-        return {
-            "success": True,
-            "uploaded_files": uploaded_files,
-            "total_files": len(uploaded_files),
-            "volume_path": base_path
-        }
-
-    except Exception as e:
-        print(f"❌ Error uploading batch PDFs: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to upload batch PDFs: {str(e)}")
-
-
-@app.post("/api/trigger-batch-job")
-def trigger_batch_job():
-    """Trigger the batch processing Databricks job"""
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection not configured")
-
-    if not batch_job_id:
-        raise HTTPException(status_code=500, detail="BATCH_JOB_ID not configured")
-
-    try:
-        # Trigger the job
-        run = w.jobs.run_now(job_id=int(batch_job_id))
-
-        print(f"🚀 Triggered batch job {batch_job_id}, run_id: {run.run_id}")
-
-        return {
-            "success": True,
-            "run_id": run.run_id,
-            "job_id": batch_job_id,
-            "message": "Batch job triggered successfully"
-        }
-
-    except Exception as e:
-        print(f"❌ Error triggering batch job: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to trigger batch job: {str(e)}")
-
-
-@app.get("/api/batch-job-status/{run_id}")
-def get_batch_job_status(run_id: int):
-    """Get status of a batch job run"""
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection not configured")
-
-    try:
-        # Get run details
-        run = w.jobs.get_run(run_id=run_id)
-
-        # Extract task statuses
-        tasks = []
-        if run.tasks:
-            for task in run.tasks:
-                tasks.append({
-                    "task_key": task.task_key,
-                    "state": task.state.life_cycle_state.value if task.state and task.state.life_cycle_state else "UNKNOWN",
-                    "result_state": task.state.result_state.value if task.state and task.state.result_state else None,
-                    "start_time": task.start_time,
-                    "end_time": task.end_time
-                })
-
-        # Overall run state
-        state = run.state
-        life_cycle_state = state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
-        result_state = state.result_state.value if state and state.result_state else None
-
-        # Determine if job is still running
-        is_running = life_cycle_state in ["PENDING", "RUNNING", "TERMINATING"]
-        is_success = result_state == "SUCCESS"
-        is_failed = result_state in ["FAILED", "TIMEDOUT", "CANCELED"]
-
-        # Extract output table info from task parameters
-        output_tables = []
-        catalog = None
-        schema = None
-        raw_table = None
-        content_table = None
-
-        # Try to extract parameters from the first task (clean_pipeline_tables has all params)
-        if run.tasks and len(run.tasks) > 0:
-            job_id = run.job_id
-            if job_id:
-                try:
-                    job = w.jobs.get(job_id=job_id)
-
-                    # First, try job-level parameters (for backward compatibility)
-                    if job.settings and job.settings.parameters:
-                        params = job.settings.parameters
-                        catalog = params.get('catalog', '')
-                        schema = params.get('schema', '')
-                        raw_table = params.get('raw_table_name', '')
-                        content_table = params.get('content_table_name', '')
-
-                    # If not found, extract from task-level base_parameters
-                    if not catalog and job.settings and job.settings.tasks:
-                        for task_def in job.settings.tasks:
-                            # Look for the clean_pipeline_tables or parse_documents task which has all params
-                            if task_def.task_key in ['clean_pipeline_tables', 'parse_documents', 'extract_content']:
-                                if task_def.notebook_task and task_def.notebook_task.base_parameters:
-                                    params = task_def.notebook_task.base_parameters
-                                    if not catalog:
-                                        catalog = params.get('catalog', '')
-                                    if not schema:
-                                        schema = params.get('schema', '')
-                                    if not raw_table:
-                                        raw_table = params.get('raw_table_name') or params.get('table_name', '')
-                                    if not content_table:
-                                        content_table = params.get('content_table_name', '')
-
-                                    # If we found catalog and schema, we can build the table paths
-                                    if catalog and schema:
-                                        break
-
-                    # Build output table list
-                    if catalog and schema:
-                        if raw_table:
-                            output_tables.append(f"{catalog}.{schema}.{raw_table}")
-                        if content_table:
-                            output_tables.append(f"{catalog}.{schema}.{content_table}")
-
-                except Exception as e:
-                    print(f"⚠️ Could not fetch job parameters: {e}")
-
-        return {
-            "success": True,
-            "run_id": run_id,
-            "state": life_cycle_state,
-            "result_state": result_state,
-            "is_running": is_running,
-            "is_success": is_success,
-            "is_failed": is_failed,
-            "start_time": run.start_time,
-            "end_time": run.end_time,
-            "tasks": tasks,
-            "run_page_url": run.run_page_url,
-            "output_tables": output_tables
-        }
-
-    except Exception as e:
-        print(f"❌ Error getting batch job status: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get batch job status: {str(e)}")
-
-
-@app.post("/api/batch-job-config")
-def update_batch_job_config(request: dict):
-    """Update batch job ID configuration"""
-    global batch_job_id
-
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection not configured")
-
-    new_job_id = request.get("job_id")
-    if not new_job_id:
-        raise HTTPException(status_code=400, detail="job_id is required")
-
-    try:
-        # Verify job exists and is accessible
-        job = w.jobs.get(job_id=int(new_job_id))
-
-        # Validate job structure matches expected Asset Bundle workflow
-        warnings = []
-        is_compatible = True
-        expected_task_keys = ['clean_pipeline_tables', 'parse_documents', 'extract_content']
-
-        if job.settings and job.settings.tasks:
-            actual_task_keys = [task.task_key for task in job.settings.tasks]
-
-            # Check if job has the expected task structure
-            matching_tasks = [task for task in expected_task_keys if task in actual_task_keys]
-
-            if len(matching_tasks) == 0:
-                # No matching tasks at all
-                is_compatible = False
-                warnings.append(
-                    f"⚠️ Job structure mismatch: This job has tasks {actual_task_keys} but the app expects "
-                    f"{expected_task_keys}. Output tables and batch processing may not work correctly."
-                )
-            elif len(matching_tasks) < len(expected_task_keys):
-                # Some tasks are missing
-                missing_tasks = [task for task in expected_task_keys if task not in actual_task_keys]
-                warnings.append(
-                    f"⚠️ Partial compatibility: Job is missing expected tasks: {missing_tasks}. "
-                    f"Some features may not work as intended."
-                )
-
-            # Check if tasks have expected parameters
-            if matching_tasks:
-                for task_def in job.settings.tasks:
-                    if task_def.task_key in expected_task_keys:
-                        if task_def.notebook_task and task_def.notebook_task.base_parameters:
-                            params = task_def.notebook_task.base_parameters
-                            required_params = ['catalog', 'schema']
-                            missing_params = [p for p in required_params if p not in params]
-                            if missing_params:
-                                warnings.append(
-                                    f"⚠️ Task '{task_def.task_key}' is missing required parameters: {missing_params}"
-                                )
-                                break
-        else:
-            is_compatible = False
-            warnings.append("⚠️ Job has no tasks defined. This job cannot be used for batch processing.")
-
-        # Update the global variable (persists for app lifetime)
-        batch_job_id = str(new_job_id)
-
-        # Update YAML config in memory
-        YAML_CONFIG["BATCH_JOB_ID"] = str(new_job_id)
-
-        print(f"✅ Updated BATCH_JOB_ID to {new_job_id} (in-memory)")
-        if warnings:
-            print(f"⚠️ Job validation warnings: {warnings}")
-
-        return {
-            "success": True,
-            "job_deployed": True,
-            "job_id": str(new_job_id),
-            "job_name": job.settings.name if job.settings else None,
-            "input_volume_path": batch_input_volume_path,
-            "is_compatible": is_compatible,
-            "warnings": warnings,
-            "message": f"Batch job ID updated to {new_job_id}" + (" (with warnings)" if warnings else "")
-        }
-    except Exception as e:
-        print(f"❌ Failed to update batch job config: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to update batch job config: {str(e)}")
-
-
-@app.get("/api/search-jobs")
-def search_jobs(name_filter: str = ""):
-    """Search for Databricks jobs by name"""
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection not configured")
-
-    try:
-        # List all jobs
-        jobs_list = w.jobs.list(expand_tasks=False, limit=100)
-
-        # Filter by name if provided
-        filtered_jobs = []
-        for job in jobs_list:
-            job_name = job.settings.name if job.settings and job.settings.name else ""
-            if not name_filter or name_filter.lower() in job_name.lower():
-                filtered_jobs.append({
-                    "job_id": str(job.job_id),
-                    "job_name": job_name,
-                    "created_time": job.created_time,
-                    "creator_user_name": job.creator_user_name
-                })
-
-        # Sort by created time (most recent first)
-        filtered_jobs.sort(key=lambda x: x.get("created_time", 0), reverse=True)
-
-        return {
-            "success": True,
-            "jobs": filtered_jobs[:20],  # Return top 20 results
-            "total_found": len(filtered_jobs)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to search jobs: {str(e)}")
-
+# ---------------------------------------------------------------------------
+# Upload to UC Volume
+# ---------------------------------------------------------------------------
 
 @app.post("/api/upload-to-uc")
 async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
-    """Upload files to Databricks UC Volume"""
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
-    
+
     try:
         uploaded_files = []
+        base_path = get_uc_volume_path().rstrip('/')
 
-        base_path = get_uc_volume_path().rstrip('/')  # Remove trailing slash
-
-        # Check if base volume path exists, create if it doesn't
-        try:
-            w.files.get_status(path=base_path)
-            print(f"✅ Base volume path exists: {base_path}")
-        except Exception:
-            # Base path doesn't exist, try to create it
+        # Ensure base path and images dir exist
+        for dir_path in [base_path, f"{base_path}/images"]:
             try:
-                w.files.create_directory(directory_path=base_path)
-                print(f"✅ Created base volume path: {base_path}")
-            except Exception as create_error:
-                # Check if error is because directory already exists
-                if "already exists" in str(create_error).lower() or "file_already_exists" in str(create_error).lower():
-                    print(f"📁 Base volume path already exists: {base_path}")
-                else:
-                    print(f"⚠️ Warning: Could not create base volume path: {create_error}")
+                w.files.create_directory(directory_path=dir_path)
+            except Exception:
+                pass  # Already exists
 
-        # Create "images" directory in UC Volume if it doesn't exist
-        images_dir_path = f"{base_path}/images"
-
-        try:
-            # Try to create the images directory
-            w.files.create_directory(directory_path=images_dir_path)
-            print(f"✅ Created images directory: {images_dir_path}")
-        except Exception as dir_error:
-            # Directory might already exist, check if it's a "directory already exists" error
-            if "already exists" in str(dir_error).lower() or "file_already_exists" in str(dir_error).lower():
-                print(f"📁 Images directory already exists: {images_dir_path}")
-            else:
-                print(f"⚠️ Warning: Could not create images directory: {dir_error}")
-        
         for file in files:
-            # Create a temporary file to store the uploaded content
             with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                # Copy file content to temporary file
                 shutil.copyfileobj(file.file, temp_file)
                 temp_file_path = temp_file.name
-            
+
             try:
-                # Upload to UC Volume
                 uc_file_path = f"{base_path}/{file.filename}"
-                
-                # Delete existing file/directory first to prevent directory creation issue
-                print(f"🔍 Checking for existing content at: {uc_file_path}")
-                
-                # Try multiple deletion strategies to ensure clean upload
-                deleted = False
-                
-                # Strategy 1: Try deleting as directory first (most common issue)
+
+                # Clean up any existing file/directory at that path
                 try:
                     w.files.delete(file_path=uc_file_path, recursive=True)
-                    print(f"🗑️ Successfully deleted existing directory: {uc_file_path}")
-                    deleted = True
-                except Exception as e1:
-                    print(f"📝 Directory delete attempt failed: {str(e1)[:100]}...")
-                    
-                    # Strategy 2: Try deleting as file
-                    try:
-                        w.files.delete(file_path=uc_file_path)
-                        print(f"🗑️ Successfully deleted existing file: {uc_file_path}")
-                        deleted = True
-                    except Exception as e2:
-                        print(f"📝 File delete attempt failed: {str(e2)[:100]}...")
-                
-                if not deleted:
-                    print(f"📝 No existing content found to delete at: {uc_file_path}")
-                else:
-                    # Verify deletion worked
-                    try:
-                        # Try to get status - this should fail if deletion worked
-                        w.files.get_status(path=uc_file_path)
-                        print("⚠️ WARNING: Content still exists after deletion attempt!")
-                    except Exception:
-                        print("✅ Verified: Path is now clear for upload")
-                
-                # Add a longer delay to ensure delete operation completes
-                import time
-                time.sleep(0.5)  # Increased delay
-                
-                # Upload to UC Volume using the Files API with file handle
-                print(f"📤 Starting upload to: {uc_file_path}")
+                except Exception:
+                    pass
+                try:
+                    w.files.delete(file_path=uc_file_path)
+                except Exception:
+                    pass
+
+                time.sleep(0.5)
+
                 with open(temp_file_path, 'rb') as f:
-                    w.files.upload(
-                        file_path=uc_file_path,
-                        contents=f,
-                        overwrite=True  # Use overwrite=True as additional safety
-                    )
-                print(f"✅ Upload completed successfully: {uc_file_path}")
-                
-                # Get file size for response
+                    w.files.upload(file_path=uc_file_path, contents=f, overwrite=True)
+
                 file_size = os.path.getsize(temp_file_path)
-                
-                uploaded_files.append({
-                    "name": file.filename,
-                    "path": uc_file_path,
-                    "size": file_size
-                })
-                
+                uploaded_files.append({"name": file.filename, "path": uc_file_path, "size": file_size})
             finally:
-                # Clean up temporary file
                 os.unlink(temp_file_path)
-        
+
         return {
             "success": True,
             "uploaded_files": uploaded_files,
-            "message": f"Successfully uploaded {len(uploaded_files)} files to UC Volume"
+            "message": f"Successfully uploaded {len(uploaded_files)} files"
         }
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
+# ---------------------------------------------------------------------------
+# Write to Delta (ai_parse_document)
+# ---------------------------------------------------------------------------
+
 @app.post("/api/write-to-delta-table")
 def write_to_delta_table(request: WriteToTableRequest):
-    """Write processed documents to delta table using ai_parse_document - supports batch and append mode"""
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
-
     if not current_warehouse_id:
         raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
-
     if not request.file_paths:
         raise HTTPException(status_code=400, detail="file_paths is required")
 
     try:
-        # Get the existing delta table path
         destination_table = get_delta_table_path()
-        print(f"Working with delta table: {destination_table}")
-        print(f"Processing {len(request.file_paths)} file(s) in {request.operation_mode} mode")
-        print(f"Files to process: {request.file_paths}")
-        
-        print("Checking table schema...")
-        try:
-            # Check if table has new schema
-            has_new_schema = False
-            if not has_new_schema:
-                print("Table has old schema or doesn't exist. Creating/recreating table...")
-                
-                # First drop the table
-                drop_query = f"DROP TABLE IF EXISTS IDENTIFIER('{destination_table}')"
-                
-                drop_result = w.statement_execution.execute_statement(
-                    statement=drop_query,
-                    warehouse_id=current_warehouse_id,
-                    wait_timeout='30s'
-                )
-                
-                if drop_result.status and drop_result.status.state == StatementState.FAILED:
-                    raise Exception(f"Failed to drop table: {drop_result.status}")
-                
-                # Then create the table with new schema
-                create_query = f"""
-                CREATE TABLE IDENTIFIER('{destination_table}') (
-                    path STRING,
-                    element_id BIGINT,
-                    type STRING,
-                    bbox ARRAY<DOUBLE>,
-                    page_id STRING,
-                    content STRING,
-                    description STRING,
-                    image_uri STRING
-                ) USING DELTA
-                """
-                
-                create_result = w.statement_execution.execute_statement(
-                    statement=create_query,
-                    warehouse_id=current_warehouse_id,
-                    wait_timeout='30s'
-                )
-                
-                if create_result.status and create_result.status.state == StatementState.FAILED:
-                    raise Exception(f"Failed to create table: {create_result.status}")
-                    
-                print("Table recreated with new schema")
-            else:
-                print("Table already has correct schema")
-                
-        except Exception as e:
-            if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
-                print("Table doesn't exist, creating new table...")
-                create_table_query = f"""
-                CREATE TABLE IDENTIFIER('{destination_table}') (
-                    path STRING,
-                    element_id BIGINT,
-                    type STRING,
-                    bbox ARRAY<DOUBLE>,
-                    page_id STRING,
-                    content STRING,
-                    description STRING,
-                    image_uri STRING
-                ) USING DELTA
-                """
-                
-                create_result = w.statement_execution.execute_statement(
-                    statement=create_table_query,
-                    warehouse_id=current_warehouse_id,
-                    wait_timeout='30s'
-                )
-                
-                if create_result.status and create_result.status.state == StatementState.FAILED:
-                    raise Exception(f"Failed to create table: {create_result.status}")
-            else:
-                raise e
-        
-        print("Table exists with correct schema")
+        print(f"Processing {len(request.file_paths)} file(s) into {destination_table}")
 
-        # Handle deletion based on operation mode
-        if request.operation_mode == 'replace':
-            # TRUNCATE entire table - delete ALL existing records
-            truncate_query = f"""
-            DELETE FROM IDENTIFIER('{destination_table}')
-            """
+        # Ensure table exists
+        create_query = f"""
+        CREATE TABLE IF NOT EXISTS IDENTIFIER('{destination_table}') (
+            path STRING,
+            element_id BIGINT,
+            type STRING,
+            bbox ARRAY<DOUBLE>,
+            page_id STRING,
+            content STRING,
+            description STRING,
+            image_uri STRING
+        ) USING DELTA
+        """
+        execute_sql(create_query, '30s')
 
-            print("Truncating entire table (replace mode)...")
-            truncate_result = w.statement_execution.execute_statement(
-                statement=truncate_query,
-                warehouse_id=current_warehouse_id,
-                wait_timeout='30s'
-            )
-
-            if truncate_result.status and truncate_result.status.state == StatementState.FAILED:
-                print(f"Truncate operation failed: {truncate_result.status}")
-            else:
-                print("Table truncated successfully")
-        elif request.operation_mode == 'append':
-            # In append mode, delete only the specific files being processed to avoid duplicates
-            for file_path in request.file_paths:
-                if file_path.startswith('/Volumes/'):
-                    dbfs_path = 'dbfs:' + file_path
-                else:
-                    dbfs_path = file_path
-
-                delete_query = f"""
-                DELETE FROM IDENTIFIER('{destination_table}')
-                WHERE path = '{dbfs_path}'
-                """
-
-                print(f"Deleting existing records for {dbfs_path} (append mode)...")
-                delete_result = w.statement_execution.execute_statement(
-                    statement=delete_query,
-                    warehouse_id=current_warehouse_id,
-                    wait_timeout='30s'
-                )
-
-                if delete_result.status and delete_result.status.state == StatementState.FAILED:
-                    print(f"Delete operation failed for {dbfs_path}: {delete_result.status}")
-                else:
-                    print(f"Existing records deleted successfully for {dbfs_path}")
-        
-        # Process all files in a SINGLE batch INSERT using ai_parse_document
-        # Convert all file paths to dbfs format
-        dbfs_paths = []
+        # Delete existing records for these files (append mode dedupe)
         for file_path in request.file_paths:
-            if file_path.startswith('/Volumes/'):
-                dbfs_path = 'dbfs:' + file_path
-            else:
-                dbfs_path = file_path
-            dbfs_paths.append(dbfs_path)
+            dbfs_path = f"dbfs:{file_path}" if file_path.startswith('/Volumes/') else file_path
+            execute_sql(f"DELETE FROM IDENTIFIER('{destination_table}') WHERE path = '{dbfs_path}'", '30s')
 
-        print(f"Processing {len(dbfs_paths)} files in batch: {dbfs_paths}")
+        # Build file CTE
+        dbfs_paths = []
+        for fp in request.file_paths:
+            dbfs_paths.append(f"dbfs:{fp}" if fp.startswith('/Volumes/') else fp)
 
-        # Use the parent directory from the first file for image output
         first_file_path = request.file_paths[0]
-        base_path = re.sub(r'/[^/]+$', '', first_file_path)  # Remove the file name at the end
+        base_path = re.sub(r'/[^/]+$', '', first_file_path)
 
-        # Check if all files are in the same directory
-        all_same_dir = all(
-            re.sub(r'/[^/]+$', '', path) == base_path
-            for path in request.file_paths
-        )
-
-        # Create a single INSERT query that processes ALL files in batch
-        if all_same_dir and len(request.file_paths) > 1:
-            # OPTIMIZATION: All files in same directory - use glob pattern
-            # This is much more efficient than UNION ALL for many files
-            dbfs_base_path = f"dbfs:{base_path}" if base_path.startswith('/Volumes/') else base_path
-            read_files_pattern = f"'{dbfs_base_path}/*.pdf'"
-            print(f"Using optimized glob pattern for batch processing: {read_files_pattern}")
-            file_cte = f"SELECT path, content FROM READ_FILES({read_files_pattern}, format => 'binaryFile')"
-        else:
-            # Files in different directories - use UNION ALL
-            print("Using UNION ALL for files in different directories")
-            read_files_union = ' UNION ALL '.join([
-                f"SELECT path, content FROM READ_FILES('{dbfs_path}', format => 'binaryFile')"
-                for dbfs_path in dbfs_paths
-            ])
-            file_cte = read_files_union
+        file_cte = ' UNION ALL '.join([
+            f"SELECT path, content FROM READ_FILES('{p}', format => 'binaryFile')"
+            for p in dbfs_paths
+        ])
 
         insert_query = f"""
         INSERT INTO IDENTIFIER('{destination_table}')
@@ -912,137 +307,62 @@ def write_to_delta_table(request: WriteToTableRequest):
           {file_cte}
         ),
         parsed as (
-          SELECT
-            path,
-              ai_parse_document(
-                  content,
-                  map('version', '2.0',
-                      'imageOutputPath', '{base_path}/images',
-                      'descriptionElementTypes', '*')
-              ) as parsed
+          SELECT path,
+            ai_parse_document(
+              content,
+              map('version', '2.0',
+                  'imageOutputPath', '{base_path}/images',
+                  'descriptionElementTypes', '*')
+            ) as parsed
           FROM file
         ),
         pages as (
-          SELECT
-              path,
-              id as page_id,
-              cast(image_uri:image_uri as string) as image_uri
-          FROM
-          (
-              SELECT
-                  path,
-                  posexplode(try_cast(parsed:document:pages AS ARRAY<VARIANT>)) AS (id, image_uri)
-              FROM parsed
-              WHERE parsed:document:pages IS NOT NULL
-              AND CAST(parsed:error_status AS STRING) IS NULL
+          SELECT path, id as page_id, cast(image_uri:image_uri as string) as image_uri
+          FROM (
+            SELECT path, posexplode(try_cast(parsed:document:pages AS ARRAY<VARIANT>)) AS (id, image_uri)
+            FROM parsed
+            WHERE parsed:document:pages IS NOT NULL AND CAST(parsed:error_status AS STRING) IS NULL
           )
         ),
         elements as (
-          select
-            path,
+          SELECT path,
             cast(items:id as int) as element_id,
             cast(items:type as string) as type,
             cast(items:bbox[0]:coord as ARRAY<DOUBLE>) as bbox,
             cast(items:bbox[0]:page_id as int) as page_id,
-            CASE
-              WHEN cast(items:type as string) = 'figure' THEN cast(items:description as string)
-              ELSE cast(items:content as string)
-            END as content,
+            CASE WHEN cast(items:type as string) = 'figure' THEN cast(items:description as string)
+              ELSE cast(items:content as string) END as content,
             cast(items:description as string) as description
-          from
-          (
-            SELECT
-              path,
-              posexplode(try_cast(parsed:document:elements AS ARRAY<VARIANT>)) AS (idx, items)
+          FROM (
+            SELECT path, posexplode(try_cast(parsed:document:elements AS ARRAY<VARIANT>)) AS (idx, items)
             FROM parsed
-            WHERE
-              parsed:document:elements IS NOT NULL
-              AND CAST(parsed:error_status AS STRING) IS NULL
+            WHERE parsed:document:elements IS NOT NULL AND CAST(parsed:error_status AS STRING) IS NULL
           )
         )
-        select
-            e.*,
-            p.image_uri
-        from elements e
-        inner join pages p
-        on e.path = p.path and e.page_id = p.page_id
+        SELECT e.*, p.image_uri FROM elements e
+        INNER JOIN pages p ON e.path = p.path AND e.page_id = p.page_id
         """
 
-        print(f"Executing BATCH INSERT for {len(request.file_paths)} files")
+        print("Executing ai_parse_document INSERT...")
+        result = execute_sql(insert_query)
 
-        try:
-            insert_result = w.statement_execution.execute_statement(
-                statement=insert_query,
-                warehouse_id=current_warehouse_id,
-                wait_timeout='50s'  # Maximum allowed by Databricks (5s-50s range)
-            )
-
-            print(f"BATCH INSERT result: {insert_result.status}")
-
-            # If the operation is still pending or running, wait for it to complete
-            if insert_result.status and insert_result.status.state in [StatementState.PENDING, StatementState.RUNNING]:
-                print("BATCH INSERT operation is pending, waiting for completion...")
-                try:
-                    # Wait for the statement to complete
-                    final_result = w.statement_execution.get_statement(insert_result.statement_id)
-
-                    # Keep checking until it's no longer pending or running (up to 10 minutes for batch)
-                    max_wait = 600
-                    waited = 0
-                    while final_result.status.state in [StatementState.PENDING, StatementState.RUNNING] and waited < max_wait:
-                        time.sleep(5)
-                        waited += 5
-                        final_result = w.statement_execution.get_statement(insert_result.statement_id)
-                        print(f"Waiting for BATCH INSERT completion... ({waited}s) - Status: {final_result.status.state}")
-
-                    print(f"Final BATCH INSERT result: {final_result.status}")
-                    insert_result = final_result
-
-                except Exception as wait_error:
-                    print(f"Error waiting for BATCH INSERT completion: {wait_error}")
-
-            if insert_result.status and insert_result.status.state == StatementState.SUCCEEDED:
-                print(f"Successfully processed all {len(request.file_paths)} files in batch")
-                # Return all files as successful
-                return {
-                    "success": True,
-                    "destination_table": destination_table,
-                    "processed_files": request.file_paths,
-                    "failed_files": [],
-                    "total_processed": len(request.file_paths),
-                    "total_failed": 0,
-                    "operation_mode": request.operation_mode,
-                    "message": f"Successfully processed all {len(request.file_paths)} files in batch ({request.operation_mode} mode)"
-                }
-            else:
-                error_msg = "Batch processing failed"
-                if insert_result.status and insert_result.status.error:
-                    error_msg += f": {insert_result.status.error}"
-                print(error_msg)
-                # Return all files as failed
-                return {
-                    "success": False,
-                    "destination_table": destination_table,
-                    "processed_files": [],
-                    "failed_files": [{"file_path": fp, "error": error_msg} for fp in request.file_paths],
-                    "total_processed": 0,
-                    "total_failed": len(request.file_paths),
-                    "operation_mode": request.operation_mode,
-                    "message": error_msg
-                }
-
-        except Exception as batch_error:
-            error_msg = f"Error in batch processing: {str(batch_error)}"
-            print(error_msg)
-            # Return all files as failed
+        if result.status and result.status.state == StatementState.SUCCEEDED:
+            return {
+                "success": True,
+                "destination_table": destination_table,
+                "processed_files": request.file_paths,
+                "failed_files": [],
+                "message": f"Successfully processed {len(request.file_paths)} files"
+            }
+        else:
+            error_msg = "Processing failed"
+            if result.status and result.status.error:
+                error_msg += f": {result.status.error}"
             return {
                 "success": False,
                 "destination_table": destination_table,
                 "processed_files": [],
                 "failed_files": [{"file_path": fp, "error": error_msg} for fp in request.file_paths],
-                "total_processed": 0,
-                "total_failed": len(request.file_paths),
-                "operation_mode": request.operation_mode,
                 "message": error_msg
             }
 
@@ -1050,640 +370,568 @@ def write_to_delta_table(request: WriteToTableRequest):
         print(f"Delta table write error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to write to delta table: {str(e)}")
 
-@app.get("/api/processed-files")
-def list_processed_files():
-    """Get list of all unique files in the delta table with metadata"""
-    if not w:
-        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
 
-    if not current_warehouse_id:
-        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
-
-    try:
-        destination_table = get_delta_table_path()
-        print(f"Listing processed files from delta table: {destination_table}")
-
-        query = f"""
-        SELECT
-            path,
-            COUNT(DISTINCT page_id) as total_pages,
-            COUNT(*) as total_elements,
-            MIN(element_id) as first_element_id,
-            MAX(element_id) as last_element_id
-        FROM IDENTIFIER('{destination_table}')
-        GROUP BY path
-        ORDER BY path
-        """
-
-        print(f"Executing processed files query: {query}")
-
-        result = w.statement_execution.execute_statement(
-            statement=query,
-            warehouse_id=current_warehouse_id,
-            wait_timeout='30s'
-        )
-
-        if result.result and result.result.data_array:
-            processed_files = []
-            for row in result.result.data_array:
-                path = row[0] if len(row) > 0 else ""
-                total_pages = int(row[1]) if len(row) > 1 and row[1] is not None else 0
-                total_elements = int(row[2]) if len(row) > 2 and row[2] is not None else 0
-
-                # Extract filename from path
-                filename = path.split('/')[-1] if path else "Unknown"
-
-                processed_files.append({
-                    "path": path,
-                    "filename": filename,
-                    "total_pages": total_pages,
-                    "total_elements": total_elements
-                })
-
-            print(f"Found {len(processed_files)} processed files")
-            return {
-                "success": True,
-                "processed_files": processed_files,
-                "total_files": len(processed_files),
-                "table_name": destination_table
-            }
-        else:
-            print("No processed files found")
-            return {
-                "success": True,
-                "processed_files": [],
-                "total_files": 0,
-                "message": "No processed files found in delta table"
-            }
-
-    except Exception as e:
-        print(f"Processed files query error: {e}")
-        return {
-            "success": False,
-            "processed_files": [],
-            "total_files": 0,
-            "error": f"Failed to list processed files: {str(e)}"
-        }
+# ---------------------------------------------------------------------------
+# Query Delta Table
+# ---------------------------------------------------------------------------
 
 @app.post("/api/query-delta-table")
 def query_delta_table(request: QueryDeltaTableRequest):
-    """Query delta table results for specific documents"""
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
-    
     if not current_warehouse_id:
         raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
 
     try:
-        # Get the delta table path
         destination_table = get_delta_table_path()
-        print(f"Querying delta table: {destination_table}")
-        
-        # Build the query with optional file filtering and page filtering
         where_conditions = []
-        
+
         if request.file_paths:
-            # Convert to dbfs: format for filtering
-            dbfs_file_paths = []
-            for fp in request.file_paths:
-                if fp.startswith('/Volumes/'):
-                    dbfs_path = 'dbfs:' + fp
-                else:
-                    dbfs_path = fp
-                dbfs_file_paths.append(dbfs_path)
-            
-            # Use exact path matching instead of LIKE with filename
+            dbfs_file_paths = [f"dbfs:{fp}" if fp.startswith('/Volumes/') else fp for fp in request.file_paths]
             path_conditions = ", ".join([f"'{fp}'" for fp in dbfs_file_paths])
             where_conditions.append(f"path IN ({path_conditions})")
-        
+
         if request.page_number is not None:
             where_conditions.append(f"page_id = {request.page_number}")
-        
-        where_clause = ""
-        if where_conditions:
-            where_clause = f"WHERE {' AND '.join(where_conditions)}"
-        
+
+        where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
         query = f"""
-        SELECT
-            path,
-            element_id,
-            type,
-            cast(bbox as ARRAY<DOUBLE>) as bbox,
-            page_id,
-            content,
-            description,
-            image_uri
+        SELECT path, element_id, type, cast(bbox as ARRAY<DOUBLE>) as bbox,
+               page_id, content, description, image_uri
         FROM IDENTIFIER('{destination_table}')
         {where_clause}
         ORDER BY page_id, element_id
         """
-        
-        print(f"Executing query: {query}")
-        
+
         result = w.statement_execution.execute_statement(
-            statement=query,
-            warehouse_id=current_warehouse_id,
-            wait_timeout='30s'
+            statement=query, warehouse_id=current_warehouse_id, wait_timeout='30s'
         )
 
         if result.result and result.result.data_array:
-            delta_results = []
-            for row in result.result.data_array:
-                delta_results.append({
-                    "path": row[0] if len(row) > 0 else "",
-                    "element_id": row[1] if len(row) > 1 else None,
-                    "type": row[2] if len(row) > 2 else "",
-                    "bbox": row[3] if len(row) > 3 else None,
-                    "page_id": row[4] if len(row) > 4 else "",
-                    "content": row[5] if len(row) > 5 else "",
-                    "description": row[6] if len(row) > 6 else "",
-                    "image_uri": row[7] if len(row) > 7 else ""
-                })
-            
-            print(f"Returning {len(delta_results)} results from delta table")
-            return {
-                "success": True,
-                "data": delta_results,
-                "table_name": destination_table,
-                "total_results": len(delta_results)
-            }
-        else:
-            print("No data returned from query")
-            return {
-                "success": True,
-                "data": [],
-                "message": "No results found in delta table"
-            }
+            data = [
+                {"path": r[0], "element_id": r[1], "type": r[2], "bbox": r[3],
+                 "page_id": r[4], "content": r[5], "description": r[6], "image_uri": r[7]}
+                for r in result.result.data_array
+            ]
+            return {"success": True, "data": data, "total_results": len(data)}
+        return {"success": True, "data": [], "message": "No results found"}
 
     except Exception as e:
-        print(f"Delta table query error: {e}")
-        return {
-            "success": False,
-            "data": [],
-            "error": f"Failed to query delta table: {str(e)}"
-        }
+        return {"success": False, "data": [], "error": f"Query failed: {str(e)}"}
+
+
+# ---------------------------------------------------------------------------
+# Page Metadata
+# ---------------------------------------------------------------------------
 
 @app.post("/api/page-metadata")
 def get_page_metadata(request: PageMetadataRequest):
-    """Get page metadata including total pages and elements count per page"""
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
-    
     if not current_warehouse_id:
         raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
 
     try:
         destination_table = get_delta_table_path()
-        print(f"Getting page metadata from delta table: {destination_table}")
-        
-        # Build the query with optional file filtering
         where_conditions = []
-        
+
         if request.file_paths:
-            # Convert to dbfs: format for filtering
-            dbfs_file_paths = []
-            for fp in request.file_paths:
-                if fp.startswith('/Volumes/'):
-                    dbfs_path = 'dbfs:' + fp
-                else:
-                    dbfs_path = fp
-                dbfs_file_paths.append(dbfs_path)
-            
-            # Use exact path matching
+            dbfs_file_paths = [f"dbfs:{fp}" if fp.startswith('/Volumes/') else fp for fp in request.file_paths]
             path_conditions = ", ".join([f"'{fp}'" for fp in dbfs_file_paths])
             where_conditions.append(f"path IN ({path_conditions})")
-        
-        where_clause = ""
-        if where_conditions:
-            where_clause = f"WHERE {' AND '.join(where_conditions)}"
-        
-        # Query to get page metadata
+
+        where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
         query = f"""
-        SELECT
-            page_id,
-            COUNT(*) as elements_count,
-            COUNT(DISTINCT path) as file_count
+        SELECT page_id, COUNT(*) as elements_count
         FROM IDENTIFIER('{destination_table}')
         {where_clause}
-        GROUP BY page_id
-        ORDER BY page_id
+        GROUP BY page_id ORDER BY page_id
         """
-        
-        print(f"Executing page metadata query: {query}")
-        
+
         result = w.statement_execution.execute_statement(
-            statement=query,
-            warehouse_id=current_warehouse_id,
-            wait_timeout='30s'
+            statement=query, warehouse_id=current_warehouse_id, wait_timeout='30s'
         )
 
         if result.result and result.result.data_array:
-            pages_metadata = []
+            pages = []
             total_elements = 0
-            
             for row in result.result.data_array:
-                page_id = row[0] if len(row) > 0 else None
-                elements_count = int(row[1]) if len(row) > 1 and row[1] is not None else 0
-                file_count = int(row[2]) if len(row) > 2 and row[2] is not None else 0
-                
+                page_id = row[0]
+                count = int(row[1]) if row[1] else 0
                 if page_id is not None:
-                    pages_metadata.append({
-                        "page_id": int(page_id),  # Ensure page_id is integer
-                        "page_number": int(page_id) + 1,  # Display page number starting from 1
-                        "elements_count": elements_count,
-                        "file_count": file_count
-                    })
-                    total_elements += elements_count
-            
-            print(f"Returning metadata for {len(pages_metadata)} pages with {total_elements} total elements")
-            return {
-                "success": True,
-                "total_pages": len(pages_metadata),
-                "total_elements": total_elements,
-                "pages": pages_metadata,
-                "table_name": destination_table
-            }
-        else:
-            print("No page metadata found")
-            return {
-                "success": True,
-                "total_pages": 0,
-                "total_elements": 0,
-                "pages": [],
-                "message": "No pages found in delta table"
-            }
+                    pages.append({"page_id": int(page_id), "page_number": int(page_id) + 1, "elements_count": count})
+                    total_elements += count
+            return {"success": True, "total_pages": len(pages), "total_elements": total_elements, "pages": pages}
+        return {"success": True, "total_pages": 0, "total_elements": 0, "pages": []}
 
     except Exception as e:
-        print(f"Page metadata query error: {e}")
-        return {
-            "success": False,
-            "total_pages": 0,
-            "total_elements": 0,
-            "pages": [],
-            "error": f"Failed to get page metadata: {str(e)}"
-        }
+        return {"success": False, "total_pages": 0, "total_elements": 0, "pages": [], "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Visualize Page (bounding boxes)
+# ---------------------------------------------------------------------------
 
 @app.post("/api/visualize-page")
 def visualize_page(request: VisualizePageRequest):
-    """Generate page visualization with bounding boxes overlaid on the image"""
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
-    
     if not current_warehouse_id:
         raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
 
     try:
         destination_table = get_delta_table_path()
-        print(f"Creating document visualization for file: {request.file_path}")
-        
-        # Use batch query approach from image_utils.py for better performance
         where_conditions = []
-        
+
         if request.file_path:
-            # Convert to dbfs format for filtering
-            if request.file_path.startswith('/Volumes/'):
-                dbfs_path = 'dbfs:' + request.file_path
-            else:
-                dbfs_path = request.file_path
+            dbfs_path = f"dbfs:{request.file_path}" if request.file_path.startswith('/Volumes/') else request.file_path
             where_conditions.append(f"path = '{dbfs_path}'")
-        
         if request.page_number is not None:
             where_conditions.append(f"page_id = {request.page_number}")
-        
-        where_clause = ""
-        if where_conditions:
-            where_clause = f"WHERE {' AND '.join(where_conditions)}"
-        
+
+        where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
         query = f"""
-        SELECT
-            image_uri,
-            page_id,
+        SELECT image_uri, page_id,
             collect_list(named_struct(
-                'element_id', element_id,
-                'type', type, 
+                'element_id', element_id, 'type', type,
                 'bbox', cast(bbox as ARRAY<DOUBLE>),
-                'content', content,
-                'description', description
+                'content', content, 'description', description
             )) as element_data_list
         FROM IDENTIFIER('{destination_table}')
         {where_clause}
         GROUP BY image_uri, page_id
         """
-        
-        print(f"Executing visualization query: {query}")
-        
+
         result = w.statement_execution.execute_statement(
-            statement=query,
-            warehouse_id=current_warehouse_id,
-            wait_timeout='30s'
+            statement=query, warehouse_id=current_warehouse_id, wait_timeout='30s'
         )
 
         if not result.result or not result.result.data_array:
-            return {
-                "success": False,
-                "message": "No elements found for the specified page"
-            }
+            return {"success": False, "message": "No elements found"}
 
-        # Extract batch data from the optimized query
-        if len(result.result.data_array) == 0:
-            return {
-                "success": False,
-                "message": "No image data found for the specified document"
-            }
-        
-        # Process all pages from the grouped results
-        pages_data = {}
+        type_color_map = {
+            'text': 'blue', 'title': 'red', 'section_header': 'purple',
+            'table': 'lime', 'figure': 'magenta', 'page_footer': 'orange', 'page_header': 'orange'
+        }
+
+        visualizations = {}
         total_elements = 0
-        
+
         for row in result.result.data_array:
-            image_uri = row[0] if len(row) > 0 else None
-            page_id = row[1] if len(row) > 1 else None
-            element_data_list_raw = row[2] if len(row) > 2 else []
-            
-            # Debug logging to understand data format
-            print(f"Processing row - image_uri: {image_uri}, page_id: {page_id}")
-            print(f"element_data_list_raw type: {type(element_data_list_raw)}")
-            print(f"element_data_list_raw sample: {element_data_list_raw[:2] if isinstance(element_data_list_raw, list) and len(element_data_list_raw) > 0 else element_data_list_raw}")
-            
+            image_uri = row[0]
+            page_id = row[1]
+            element_data_raw = row[2]
+
             if not image_uri or page_id is None:
                 continue
-            
-            # Convert page_id to string for consistency
+
             page_id_str = str(page_id)
-            
-            # Process the collected elements for this page
             elements = []
-            if element_data_list_raw:
+
+            if element_data_raw:
                 try:
-                    # Parse the JSON string first before iterating
-                    if isinstance(element_data_list_raw, str):
-                        import json
-                        parsed_elements = json.loads(element_data_list_raw)
-                    else:
-                        parsed_elements = element_data_list_raw
-                    
-                    # Now iterate over the parsed elements
-                    for element_data in parsed_elements:
-                        try:
-                            if element_data and element_data.get('bbox') and element_data.get('type'):
-                                bbox_raw = element_data['bbox']
-                                
-                                # Convert bbox from Array<string> to Array<double> for drawing
-                                try:
-                                    if isinstance(bbox_raw, list):
-                                        # Convert string coordinates to float
-                                        bbox_coords = [float(coord) for coord in bbox_raw]
-                                    else:
-                                        print(f"Unexpected bbox format: {bbox_raw}")
-                                        continue
-                                except (ValueError, TypeError) as e:
-                                    print(f"Error converting bbox coordinates: {bbox_raw}, error: {e}")
-                                    continue
-                                
+                    parsed_elements = json.loads(element_data_raw) if isinstance(element_data_raw, str) else element_data_raw
+                    for el in parsed_elements:
+                        if el and el.get('bbox') and el.get('type'):
+                            try:
+                                bbox_coords = [float(c) for c in el['bbox']]
                                 elements.append({
-                                    "element_id": element_data.get('element_id'),
-                                    "type": element_data['type'],
+                                    "element_id": el.get('element_id'),
+                                    "type": el['type'],
                                     "bbox": bbox_coords,
-                                    "content": element_data.get('content', ''),
-                                    "description": element_data.get('description', '')
+                                    "content": el.get('content', ''),
+                                    "description": el.get('description', '')
                                 })
-                        except (TypeError, AttributeError) as e:
-                            print(f"Error processing individual element: {element_data}, error: {e}")
-                            continue
-                            
-                except (json.JSONDecodeError, TypeError) as e:
-                    print(f"Error parsing element_data_list_raw as JSON: {element_data_list_raw}, error: {e}")
+                            except (ValueError, TypeError):
+                                continue
+                except (json.JSONDecodeError, TypeError):
                     continue
-            
-            if elements:  # Only include pages that have elements
-                pages_data[page_id_str] = {
-                    "image_uri": image_uri,
-                    "elements": elements,
-                    "elements_count": len(elements)
-                }
-                total_elements += len(elements)
 
-        print(f"Found {len(pages_data)} pages with {total_elements} total elements")
+            if not elements:
+                continue
 
-        # Process each page to generate visualizations
-        visualizations = {}
-        
-        for page_id, page_data in pages_data.items():
-            image_uri = page_data["image_uri"]
-            elements = page_data["elements"]
-            
+            total_elements += len(elements)
+
+            # Download and annotate image
             try:
-                # Convert image_uri from dbfs format to volume format for download
-                if image_uri.startswith('dbfs:/Volumes/'):
-                    download_path = image_uri[5:]  # Remove 'dbfs:' prefix
-                else:
-                    download_path = image_uri
-                
-                print(f"Downloading image from: {download_path}")
+                download_path = image_uri[5:] if image_uri.startswith('dbfs:/Volumes/') else image_uri
                 image_response = w.files.download(file_path=download_path)
-                
-                # Convert response to PIL Image
+
                 image_bytes = None
                 if hasattr(image_response, 'contents'):
                     if isinstance(image_response.contents, bytes):
                         image_bytes = image_response.contents
-                    elif hasattr(image_response.contents, 'iter_content'):
-                        image_bytes = b''.join(chunk for chunk in image_response.contents.iter_content(chunk_size=8192))
                     elif hasattr(image_response.contents, 'read'):
                         image_bytes = image_response.contents.read()
                 elif hasattr(image_response, 'content'):
                     image_bytes = image_response.content
-                elif hasattr(image_response, 'iter_content'):
-                    image_bytes = b''.join(chunk for chunk in image_response.iter_content(chunk_size=8192))
-                
-                if not image_bytes:
-                    print(f"Could not extract image bytes for page {page_id}")
-                    continue
-                    
-                image = Image.open(io.BytesIO(image_bytes))
-                print(f"Loaded image for page {page_id}: Size {image.size}")
-                
-                # Use the exact drawing logic from image_utils.py for consistency
-                type_color_map = {
-                    'text': 'blue', 
-                    'title': 'red', 
-                    'section_header': 'purple', 
-                    'table': 'lime', 
-                    'figure': 'magenta', 
-                    'page_footer': 'orange', 
-                    'page_header': 'orange'
-                }
-                
-                image_with_boxes = image.copy()
-                
-                # Convert elements to the format expected by the drawing logic
-                type_bbox_tuples = [(element["type"], element["bbox"]) for element in elements if element.get("bbox")]
-                
-                for label, bbox_coords in type_bbox_tuples:
-                    try:
-                        color = type_color_map.get(label, 'gray')
-                        
-                        # Create draw object
-                        draw = ImageDraw.Draw(image_with_boxes)
-                        
-                        # Draw the bounding box with thicker lines (using image_utils.py width=5)
-                        draw.rectangle(bbox_coords, outline=color, width=5)
-                        
-                        # Draw the label
-                        try:
-                            # Try to use a better font if available (matching image_utils.py)
-                            font = ImageFont.truetype("arial.ttf", 16)
-                        except (OSError, IOError):
-                            font = ImageFont.load_default()
-                        
-                        # Get text dimensions (using textbbox for newer PIL versions)
-                        try:
-                            bbox_text = draw.textbbox((0, 0), label, font=font)
-                            text_width = bbox_text[2] - bbox_text[0]
-                            text_height = bbox_text[3] - bbox_text[1]
-                        except AttributeError:
-                            # Fallback for older PIL versions
-                            text_width, text_height = draw.textsize(label, font=font)
-                        
-                        # Position text above the bounding box
-                        text_x = bbox_coords[0]
-                        text_y = bbox_coords[1] - text_height - 2 if bbox_coords[1] - text_height - 2 > 0 else bbox_coords[1] + 2
-                        
-                        # Draw background rectangle for text
-                        draw.rectangle(
-                            [text_x - 2, text_y - 2, text_x + text_width + 2, text_y + text_height + 2],
-                            fill='white',
-                            outline=color
-                        )
-                        
-                        # Draw the text
-                        draw.text((text_x, text_y), label, fill=color, font=font)
-                        
-                    except Exception as e:
-                        print(f"Error processing bbox: {e}")
-                        continue
 
-                # Convert image to base64 for return
+                if not image_bytes:
+                    continue
+
+                image = Image.open(io.BytesIO(image_bytes))
+                image_with_boxes = image.copy()
+
+                for element in elements:
+                    bbox = element["bbox"]
+                    label = element["type"]
+                    color = type_color_map.get(label, 'gray')
+                    draw = ImageDraw.Draw(image_with_boxes)
+                    draw.rectangle(bbox, outline=color, width=5)
+
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 16)
+                    except (OSError, IOError):
+                        font = ImageFont.load_default()
+
+                    try:
+                        bbox_text = draw.textbbox((0, 0), label, font=font)
+                        tw, th = bbox_text[2] - bbox_text[0], bbox_text[3] - bbox_text[1]
+                    except AttributeError:
+                        tw, th = draw.textsize(label, font=font)
+
+                    tx = bbox[0]
+                    ty = bbox[1] - th - 2 if bbox[1] - th - 2 > 0 else bbox[1] + 2
+                    draw.rectangle([tx - 2, ty - 2, tx + tw + 2, ty + th + 2], fill='white', outline=color)
+                    draw.text((tx, ty), label, fill=color, font=font)
+
                 buffer = io.BytesIO()
                 image_with_boxes.save(buffer, format='PNG')
                 image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                
-                # Store the visualization for this page
-                visualizations[page_id] = {
+
+                visualizations[page_id_str] = {
                     "image_base64": image_base64,
                     "elements": elements,
-                    "elements_count": len(elements),
-                    "image_uri": image_uri
+                    "elements_count": len(elements)
                 }
-                
             except Exception as e:
                 print(f"Error processing page {page_id}: {e}")
                 continue
-        
-        print(f"Successfully generated {len(visualizations)} page visualizations")
-        
-        return {
-            "success": True,
-            "visualizations": visualizations,
-            "total_pages": len(visualizations),
-            "total_elements": total_elements
-        }
+
+        return {"success": True, "visualizations": visualizations, "total_pages": len(visualizations), "total_elements": total_elements}
 
     except Exception as e:
-        print(f"Page visualization error: {e}")
+        return {"success": False, "message": f"Visualization failed: {str(e)}"}
+
+
+# ---------------------------------------------------------------------------
+# Invoice Fields Config
+# ---------------------------------------------------------------------------
+
+@app.get("/api/invoice-fields")
+def get_invoice_fields():
+    return {"fields": INVOICE_FIELDS}
+
+@app.post("/api/reload-invoice-fields")
+def reload_invoice_fields():
+    global INVOICE_FIELDS
+    INVOICE_FIELDS = load_invoice_fields()
+    return {"success": True, "fields": INVOICE_FIELDS, "count": len(INVOICE_FIELDS)}
+
+
+# ---------------------------------------------------------------------------
+# Extract Fields (ai_query)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/extract-fields")
+def extract_fields(request: ExtractFieldsRequest):
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+
+    try:
+        destination_table = get_delta_table_path()
+        file_path = request.file_path
+        dbfs_path = f"dbfs:{file_path}" if file_path.startswith('/Volumes/') else file_path
+
+        # Build the field descriptions for the prompt
+        field_descriptions = "\n".join([
+            f"- {f['name']}: {f['description']}"
+            for f in INVOICE_FIELDS
+        ])
+
+        field_names = ", ".join([f'"{f["name"]}"' for f in INVOICE_FIELDS])
+
+        # Build the extraction prompt
+        prompt = f"""You are extracting structured data from an invoice document. Extract ONLY the following fields from the document text below. Return a JSON object with exactly these keys. If a value cannot be found, use null.
+
+Fields to extract:
+{field_descriptions}
+
+IMPORTANT:
+- Return ONLY a valid JSON object, no other text or markdown.
+- Use the exact field names as keys: {field_names}
+- For dates, use YYYY-MM-DD format when possible.
+- For currency amounts, return just the number (e.g. "1234.56" not "$1,234.56").
+"""
+
+        # Use ai_query to extract fields from the parsed document content
+        # We concatenate all text content from the parsed elements
+        extract_query = f"""
+        WITH doc_content AS (
+            SELECT concat_ws('\\n', collect_list(content)) as full_text
+            FROM IDENTIFIER('{destination_table}')
+            WHERE path = '{dbfs_path}'
+            AND content IS NOT NULL
+            AND type IN ('text', 'title', 'section_header', 'table', 'page_header', 'page_footer')
+        )
+        SELECT ai_query(
+            '{ai_query_model}',
+            concat('{prompt.replace(chr(39), chr(39)+chr(39))}', '\\n\\nDocument text:\\n', full_text)
+        ) as extracted
+        FROM doc_content
+        WHERE full_text IS NOT NULL
+        """
+
+        print(f"Extracting fields for {file_path} using {ai_query_model}")
+        result = execute_sql(extract_query)
+
+        if result.status and result.status.state == StatementState.SUCCEEDED:
+            if result.result and result.result.data_array and len(result.result.data_array) > 0:
+                raw_response = result.result.data_array[0][0]
+                print(f"Raw ai_query response: {raw_response[:500] if raw_response else 'None'}")
+
+                # Parse the JSON response (handle markdown fences)
+                extracted_fields = _parse_ai_response(raw_response)
+
+                if extracted_fields:
+                    # Save to invoice results table
+                    _save_invoice_result(file_path, extracted_fields, status='extracted')
+
+                    return {
+                        "success": True,
+                        "file_path": file_path,
+                        "fields": extracted_fields
+                    }
+
+                return {
+                    "success": False,
+                    "file_path": file_path,
+                    "fields": {f['name']: None for f in INVOICE_FIELDS},
+                    "error": "Could not parse AI response"
+                }
+
+        error_msg = "Extraction query failed"
+        if result.status and result.status.error:
+            error_msg += f": {result.status.error}"
+        return {"success": False, "file_path": file_path, "fields": {f['name']: None for f in INVOICE_FIELDS}, "error": error_msg}
+
+    except Exception as e:
+        print(f"Field extraction error: {e}")
         return {
             "success": False,
-            "message": f"Failed to generate page visualization: {str(e)}"
+            "file_path": request.file_path,
+            "fields": {f['name']: None for f in INVOICE_FIELDS},
+            "error": str(e)
         }
 
 
-# Mount static files for Next.js assets (_next directory, favicon, etc.)
-# Use absolute path in Databricks Apps environment
-if os.path.exists("/Workspace/Users/q.yu@databricks.com/databricks_apps/document-intelligence/static"):
-    target_dir = "/Workspace/Users/q.yu@databricks.com/databricks_apps/document-intelligence/static"
-elif os.path.exists("/Workspace/Users/q.yu@databricks.com/databricks_apps/document-intelligence/static"):
-    target_dir = "/Workspace/Users/q.yu@databricks.com/databricks_apps/document-intelligence/static"
-else:
-    # Fallback for local development
-    target_dir = "static"
+def _parse_ai_response(raw: str) -> dict:
+    """Parse the AI response, handling markdown fences and malformed JSON."""
+    if not raw:
+        return None
+    try:
+        # Try direct parse
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # Strip markdown fences
+    cleaned = re.sub(r'```(?:json)?\s*', '', raw).strip().rstrip('`')
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # Try to extract JSON object
+    match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
 
-print(f"📁 Serving static files from: {target_dir}")
-print(f"📁 _next directory exists: {os.path.exists(f'{target_dir}/_next')}")
 
-# Mount Next.js static assets with proper error handling
+def _save_invoice_result(file_path: str, fields: dict, status: str = 'extracted'):
+    """Save or update an invoice result in the results table."""
+    try:
+        results_table = get_invoice_results_table()
+        filename = file_path.split('/')[-1]
+        fields_json = json.dumps(fields).replace("'", "''")
+
+        # Ensure table exists
+        execute_sql(f"""
+        CREATE TABLE IF NOT EXISTS IDENTIFIER('{results_table}') (
+            file_path STRING,
+            filename STRING,
+            status STRING,
+            extracted_fields STRING,
+            confirmed_fields STRING,
+            uploaded_at TIMESTAMP,
+            confirmed_at TIMESTAMP
+        ) USING DELTA
+        """, '30s')
+
+        # Check if record exists
+        check = w.statement_execution.execute_statement(
+            statement=f"SELECT COUNT(*) FROM IDENTIFIER('{results_table}') WHERE file_path = '{file_path}'",
+            warehouse_id=current_warehouse_id,
+            wait_timeout='30s'
+        )
+
+        exists = False
+        if check.result and check.result.data_array:
+            exists = int(check.result.data_array[0][0] or 0) > 0
+
+        if exists:
+            if status == 'confirmed':
+                execute_sql(f"""
+                UPDATE IDENTIFIER('{results_table}')
+                SET status = '{status}', confirmed_fields = '{fields_json}', confirmed_at = current_timestamp()
+                WHERE file_path = '{file_path}'
+                """, '30s')
+            else:
+                execute_sql(f"""
+                UPDATE IDENTIFIER('{results_table}')
+                SET status = '{status}', extracted_fields = '{fields_json}'
+                WHERE file_path = '{file_path}'
+                """, '30s')
+        else:
+            col = 'extracted_fields' if status == 'extracted' else 'confirmed_fields'
+            ts_col = 'uploaded_at' if status == 'extracted' else 'confirmed_at'
+            execute_sql(f"""
+            INSERT INTO IDENTIFIER('{results_table}')
+            (file_path, filename, status, {col}, {ts_col})
+            VALUES ('{file_path}', '{filename}', '{status}', '{fields_json}', current_timestamp())
+            """, '30s')
+
+        print(f"Saved invoice result: {file_path} ({status})")
+    except Exception as e:
+        print(f"Error saving invoice result: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Invoice Queue
+# ---------------------------------------------------------------------------
+
+@app.get("/api/invoice-queue")
+def get_invoice_queue():
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+
+    try:
+        results_table = get_invoice_results_table()
+
+        # Check if table exists
+        try:
+            result = w.statement_execution.execute_statement(
+                statement=f"""
+                SELECT file_path, filename, status, extracted_fields, confirmed_fields, uploaded_at, confirmed_at
+                FROM IDENTIFIER('{results_table}')
+                ORDER BY uploaded_at DESC
+                """,
+                warehouse_id=current_warehouse_id,
+                wait_timeout='30s'
+            )
+
+            invoices = []
+            if result.result and result.result.data_array:
+                for row in result.result.data_array:
+                    extracted = None
+                    confirmed = None
+                    try:
+                        if row[3]:
+                            extracted = json.loads(row[3])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    try:
+                        if row[4]:
+                            confirmed = json.loads(row[4])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    invoices.append({
+                        "file_path": row[0],
+                        "filename": row[1],
+                        "status": row[2],
+                        "extracted_fields": extracted,
+                        "confirmed_fields": confirmed,
+                        "uploaded_at": row[5],
+                        "confirmed_at": row[6]
+                    })
+
+            return {"success": True, "invoices": invoices}
+        except Exception as e:
+            if "TABLE_OR_VIEW_NOT_FOUND" in str(e) or "does not exist" in str(e).lower():
+                return {"success": True, "invoices": []}
+            raise
+
+    except Exception as e:
+        print(f"Invoice queue error: {e}")
+        return {"success": False, "invoices": [], "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Confirm Invoice
+# ---------------------------------------------------------------------------
+
+@app.post("/api/confirm-invoice")
+def confirm_invoice(request: ConfirmInvoiceRequest):
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+
+    try:
+        _save_invoice_result(request.file_path, request.fields, status='confirmed')
+        return {"success": True, "file_path": request.file_path, "message": "Invoice confirmed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to confirm invoice: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Static file serving
+# ---------------------------------------------------------------------------
+
+static_dir = os.getenv("STATIC_FILES_PATH", YAML_CONFIG.get("STATIC_FILES_PATH", "static"))
+if not os.path.exists(static_dir):
+    static_dir = "static"
+
+print(f"Serving static files from: {static_dir}")
+
 try:
-    if os.path.exists(f"{target_dir}/_next"):
-        app.mount("/_next", StaticFiles(directory=f"{target_dir}/_next"), name="nextjs-assets")
-        print("✅ Successfully mounted /_next static files")
-    else:
-        print("❌ _next directory not found - static assets will not be served")
+    if os.path.exists(f"{static_dir}/_next"):
+        app.mount("/_next", StaticFiles(directory=f"{static_dir}/_next"), name="nextjs-assets")
 except Exception as e:
-    print(f"❌ Failed to mount static files: {e}")
+    print(f"Failed to mount static files: {e}")
 
-# Serve other static files with better error handling
+
 @app.get("/favicon.ico")
 def favicon():
-    try:
-        favicon_path = f"{target_dir}/favicon.ico"
-        if os.path.exists(favicon_path):
-            return FileResponse(favicon_path)
-        else:
-            print(f"❌ Favicon not found at {favicon_path}")
-            raise HTTPException(status_code=404, detail="Favicon not found")
-    except Exception as e:
-        print(f"❌ Error serving favicon: {e}")
-        raise HTTPException(status_code=500, detail="Error serving favicon")
+    path = f"{static_dir}/favicon.ico"
+    if os.path.exists(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Favicon not found")
 
-@app.get("/file.svg")  
-def file_svg():
-    try:
-        file_path = f"{target_dir}/file.svg"
-        if os.path.exists(file_path):
-            return FileResponse(file_path)
-        else:
-            print(f"❌ file.svg not found at {file_path}")
-            raise HTTPException(status_code=404, detail="file.svg not found")
-    except Exception as e:
-        print(f"❌ Error serving file.svg: {e}")
-        raise HTTPException(status_code=500, detail="Error serving file.svg")
 
-# Add a catch-all route for static assets
 @app.get("/{asset_path:path}")
 def serve_static_asset(asset_path: str):
-    """Serve static assets with fallback to main page"""
-    # Handle static assets
-    if any(asset_path.endswith(ext) for ext in ['.js', '.css', '.woff2', '.svg', '.png', '.ico']):
-        static_file_path = f"{target_dir}/{asset_path}"
-        if os.path.exists(static_file_path):
-            print(f"✅ Serving static asset: {asset_path}")
-            return FileResponse(static_file_path)
-        else:
-            print(f"❌ Static asset not found: {asset_path} at {static_file_path}")
-            raise HTTPException(status_code=404, detail=f"Static asset not found: {asset_path}")
-    
-    # Handle page routes - continue with existing logic
-    return serve_react_app(asset_path)
+    if any(asset_path.endswith(ext) for ext in ['.js', '.css', '.woff2', '.svg', '.png', '.ico', '.jpg', '.jpeg']):
+        file_path = f"{static_dir}/{asset_path}"
+        if os.path.exists(file_path):
+            return FileResponse(file_path)
+        raise HTTPException(status_code=404, detail=f"Not found: {asset_path}")
 
-def serve_react_app(full_path: str):
-    """Handle Next.js page routes - serve appropriate index.html"""
-    # If the request is for a specific HTML file, serve it
-    if full_path.endswith('.html'):
-        file_path = f"{target_dir}/{full_path}"
-        if os.path.exists(file_path):
-            return FileResponse(file_path)
-    
-    
-    # For the next-steps route, serve its specific page
-    if full_path.startswith("next-steps"):
-        file_path = f"{target_dir}/next-steps/index.html"
-        if os.path.exists(file_path):
-            return FileResponse(file_path)
-    
-    # For the document-intelligence route, serve its specific page
-    if full_path.startswith("document-intelligence"):
-        file_path = f"{target_dir}/document-intelligence/index.html"
-        if os.path.exists(file_path):
-            return FileResponse(file_path)
-        
-    # For all other routes, serve the main index.html
-    return FileResponse(f"{target_dir}/index.html") 
+    # Page routes — serve appropriate HTML
+    if asset_path.startswith("document-intelligence"):
+        for p in [f"{static_dir}/document-intelligence/index.html", f"{static_dir}/document-intelligence.html"]:
+            if os.path.exists(p):
+                return FileResponse(p)
+
+    index = f"{static_dir}/index.html"
+    if os.path.exists(index):
+        return FileResponse(index)
+    raise HTTPException(status_code=404, detail="Page not found")

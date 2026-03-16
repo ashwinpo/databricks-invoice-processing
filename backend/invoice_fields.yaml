@@ -1,0 +1,33 @@
+fields:
+  - name: invoice_number
+    label: Invoice Number
+    description: The unique invoice identifier or number, often printed prominently at the top of the document
+    type: string
+  - name: invoice_date
+    label: Invoice Date
+    description: The date the invoice was issued (not the due date or ship date)
+    type: date
+  - name: vendor_number
+    label: Vendor Number
+    description: The vendor or supplier account/ID number used by the purchasing organization
+    type: string
+  - name: vendor_name
+    label: Vendor Name
+    description: The vendor or supplier company name that issued this invoice
+    type: string
+  - name: invoice_total
+    label: Invoice Total
+    description: The total amount due on the invoice, including tax and shipping if applicable
+    type: currency
+  - name: po_number
+    label: PO Number
+    description: The purchase order number associated with this invoice
+    type: string
+  - name: payment_terms
+    label: Payment Terms
+    description: Payment terms such as Net 30, Net 60, Due on Receipt, or similar
+    type: string
+  - name: due_date
+    label: Due Date
+    description: The date by which payment is due
+    type: date

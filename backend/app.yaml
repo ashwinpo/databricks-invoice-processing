@@ -11,13 +11,15 @@ env:
 - name: DATABRICKS_WAREHOUSE_ID
   value: 862f1d757f0424f7
 - name: STATIC_FILES_PATH
-  value: /Workspace/Users/q.yu@databricks.com/databricks_apps/ai-parse-job-enhanced/static
+  value: /Workspace/Users/ashwin.pothukuchi@databricks.com/databricks_apps/ai-parse-document-demo/static
 - name: NEXT_PUBLIC_API_URL
   value: https://e2-demo-field-eng.cloud.databricks.com:8000
 - name: DATABRICKS_VOLUME_PATH
-  value: /Volumes/main/ai_parse_document_demo/ai-parse-job-enhanced/
+  value: /Volumes/main/ai_parse_document_demo/ashwin_invoice_demo/
 - name: DATABRICKS_DELTA_TABLE_PATH
-  value: main.ai_parse_document_demo.ai_parse_job_enhanced_documents
-- name: BATCH_INPUT_VOLUME_PATH
-  value: /Volumes/main/ai_parse_document_demo/ai_parse_document_app_workflow/
+  value: main.ai_parse_document_demo.ashwin_invoice_demo_documents
+- name: INVOICE_RESULTS_TABLE
+  value: main.ai_parse_document_demo.ashwin_invoice_results
+- name: AI_QUERY_MODEL
+  value: databricks-claude-sonnet-4-20250514
 runtime: python_3.10
