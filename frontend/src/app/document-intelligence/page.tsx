@@ -196,14 +196,23 @@ export default function InvoiceProcessingPage() {
         )
       );
 
-      // Step 3: Extract fields
-      const extractRes = await apiCall("/api/extract-fields", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_path: ucPath }),
-      });
+      // Step 3: Extract fields (retry up to 3 times for timeouts)
+      let extractRes = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          extractRes = await apiCall("/api/extract-fields", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file_path: ucPath }),
+          });
+          if (extractRes.success) break;
+        } catch (e) {
+          console.warn(`Extract attempt ${attempt + 1}/3 failed:`, e);
+          if (attempt < 2) await sleep(5000 * (attempt + 1));
+        }
+      }
 
-      if (extractRes.success && extractRes.fields) {
+      if (extractRes?.success && extractRes.fields) {
         setInvoices((prev) =>
           prev.map((inv) =>
             inv.file_path === ucPath
@@ -213,7 +222,7 @@ export default function InvoiceProcessingPage() {
         );
       } else {
         // Extraction failed but document is parsed — still let user review manually
-        const errorDetail = extractRes.error || "Field extraction failed";
+        const errorDetail = extractRes?.error || "Field extraction failed after retries";
         console.error("Extract fields error:", errorDetail);
         setInvoices((prev) =>
           prev.map((inv) =>
@@ -221,7 +230,7 @@ export default function InvoiceProcessingPage() {
               ? {
                   ...inv,
                   status: "extracted",
-                  extracted_fields: extractRes.fields || {},
+                  extracted_fields: extractRes?.fields || {},
                   error: errorDetail,
                 }
               : inv

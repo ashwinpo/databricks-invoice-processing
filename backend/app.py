@@ -149,20 +149,40 @@ def get_invoice_results_table() -> str:
 # Helper: execute SQL and wait
 # ---------------------------------------------------------------------------
 
-def execute_sql(statement: str, wait_timeout: str = '50s'):
-    result = w.statement_execution.execute_statement(
-        statement=statement,
-        warehouse_id=current_warehouse_id,
-        wait_timeout=wait_timeout
-    )
-    if result.status and result.status.state in [StatementState.PENDING, StatementState.RUNNING]:
-        max_wait = 600
-        waited = 0
-        while result.status.state in [StatementState.PENDING, StatementState.RUNNING] and waited < max_wait:
-            time.sleep(5)
-            waited += 5
-            result = w.statement_execution.get_statement(result.statement_id)
-            print(f"Waiting for SQL completion... ({waited}s) - Status: {result.status.state}")
+def execute_sql(statement: str, wait_timeout: str = '50s', retries: int = 0):
+    """Execute SQL and poll until completion. Retries on transient failures."""
+    for attempt in range(retries + 1):
+        try:
+            result = w.statement_execution.execute_statement(
+                statement=statement,
+                warehouse_id=current_warehouse_id,
+                wait_timeout=wait_timeout
+            )
+            if result.status and result.status.state in [StatementState.PENDING, StatementState.RUNNING]:
+                max_wait = 600
+                waited = 0
+                while result.status.state in [StatementState.PENDING, StatementState.RUNNING] and waited < max_wait:
+                    time.sleep(5)
+                    waited += 5
+                    result = w.statement_execution.get_statement(result.statement_id)
+                    print(f"Waiting for SQL completion... ({waited}s) - Status: {result.status.state}")
+            # Check for transient failures worth retrying
+            if (result.status and result.status.state == StatementState.FAILED
+                    and attempt < retries):
+                error_str = str(result.status.error) if result.status.error else ""
+                if any(t in error_str.lower() for t in ["timeout", "temporarily", "unavailable", "capacity"]):
+                    wait_secs = 5 * (attempt + 1)
+                    print(f"Transient SQL failure (attempt {attempt + 1}/{retries + 1}), retrying in {wait_secs}s: {error_str[:200]}")
+                    time.sleep(wait_secs)
+                    continue
+            return result
+        except Exception as e:
+            if attempt < retries:
+                wait_secs = 5 * (attempt + 1)
+                print(f"SQL exception (attempt {attempt + 1}/{retries + 1}), retrying in {wait_secs}s: {e}")
+                time.sleep(wait_secs)
+                continue
+            raise
     return result
 
 
@@ -369,7 +389,7 @@ def write_to_delta_table(request: WriteToTableRequest):
         """
 
         print("Executing ai_parse_document INSERT...")
-        result = execute_sql(insert_query)
+        result = execute_sql(insert_query, retries=2)
 
         if result.status and result.status.state == StatementState.SUCCEEDED:
             return {
@@ -713,8 +733,7 @@ def extract_fields(request: ExtractFieldsRequest):
         """
 
         print(f"Extracting fields for {file_path} using {ai_query_model}")
-        print(f"Extract query (first 500 chars): {extract_query[:500]}")
-        result = execute_sql(extract_query)
+        result = execute_sql(extract_query, retries=2)
 
         print(f"Extract result status: {result.status}")
 
