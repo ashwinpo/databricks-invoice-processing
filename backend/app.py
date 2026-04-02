@@ -449,9 +449,7 @@ def query_delta_table(request: QueryDeltaTableRequest):
         ORDER BY page_id, element_id
         """
 
-        result = w.statement_execution.execute_statement(
-            statement=query, warehouse_id=current_warehouse_id, wait_timeout='30s'
-        )
+        result = execute_sql(query, '30s', retries=1)
 
         if result.result and result.result.data_array:
             data = [
@@ -495,9 +493,7 @@ def get_page_metadata(request: PageMetadataRequest):
         GROUP BY page_id ORDER BY page_id
         """
 
-        result = w.statement_execution.execute_statement(
-            statement=query, warehouse_id=current_warehouse_id, wait_timeout='30s'
-        )
+        result = execute_sql(query, '30s', retries=1)
 
         if result.result and result.result.data_array:
             pages = []
@@ -550,9 +546,7 @@ def visualize_page(request: VisualizePageRequest):
         GROUP BY image_uri, page_id
         """
 
-        result = w.statement_execution.execute_statement(
-            statement=query, warehouse_id=current_warehouse_id, wait_timeout='30s'
-        )
+        result = execute_sql(query, '30s', retries=1)
 
         if not result.result or not result.result.data_array:
             return {"success": False, "message": "No elements found"}
@@ -692,6 +686,7 @@ def extract_fields(request: ExtractFieldsRequest):
         destination_table = get_delta_table_path()
         file_path = request.file_path
         dbfs_path = f"dbfs:{file_path}" if file_path.startswith('/Volumes/') else file_path
+        dbfs_path_escaped = dbfs_path.replace("'", "''")
 
         # Build the field descriptions for the prompt — use \n literals for SQL
         field_lines = []
@@ -720,7 +715,7 @@ def extract_fields(request: ExtractFieldsRequest):
         WITH doc_content AS (
             SELECT concat_ws('\\n', collect_list(content)) as full_text
             FROM IDENTIFIER('{destination_table}')
-            WHERE path = '{dbfs_path}'
+            WHERE path = '{dbfs_path_escaped}'
             AND content IS NOT NULL
             AND type IN ('text', 'title', 'section_header', 'table', 'page_header', 'page_footer')
         )
@@ -746,8 +741,11 @@ def extract_fields(request: ExtractFieldsRequest):
                 extracted_fields = _parse_ai_response(raw_response)
 
                 if extracted_fields:
-                    # Save to invoice results table
-                    _save_invoice_result(file_path, extracted_fields, status='extracted')
+                    # Save to invoice results table (non-critical — don't fail the extraction)
+                    try:
+                        _save_invoice_result(file_path, extracted_fields, status='extracted')
+                    except Exception as save_err:
+                        print(f"Warning: could not save extraction result: {save_err}")
 
                     return {
                         "success": True,
@@ -816,49 +814,47 @@ def _parse_ai_response(raw: str) -> dict:
 
 
 def _save_invoice_result(file_path: str, fields: dict, status: str = 'extracted'):
-    """Save or update an invoice result in the results table."""
-    try:
-        results_table = get_invoice_results_table()
-        filename = file_path.split('/')[-1]
-        # Double-escape for SQL: replace \ with \\, then ' with ''
-        fields_json = json.dumps(fields).replace("\\", "\\\\").replace("'", "\\'")
-        file_path_escaped = file_path.replace("'", "\\'")
-        filename_escaped = filename.replace("'", "\\'")
+    """Save or update an invoice result in the results table.
 
-        # Ensure table exists
+    Raises on failure so callers can report errors to the user.
+    For non-critical callers (e.g. extract-fields), catch externally.
+    """
+    results_table = get_invoice_results_table()
+    filename = file_path.split('/')[-1]
+    fields_json = json.dumps(fields).replace("'", "''")
+    file_path_escaped = file_path.replace("'", "''")
+    filename_escaped = filename.replace("'", "''")
+
+    # Ensure table exists
+    execute_sql(f"""
+    CREATE TABLE IF NOT EXISTS IDENTIFIER('{results_table}') (
+        file_path STRING,
+        filename STRING,
+        status STRING,
+        extracted_fields STRING,
+        confirmed_fields STRING,
+        uploaded_at TIMESTAMP,
+        confirmed_at TIMESTAMP
+    ) USING DELTA
+    """, '30s')
+
+    # Upsert: delete then insert (simpler than UPDATE for Databricks SQL)
+    execute_sql(f"DELETE FROM IDENTIFIER('{results_table}') WHERE file_path = '{file_path_escaped}'", '30s')
+
+    if status == 'confirmed':
         execute_sql(f"""
-        CREATE TABLE IF NOT EXISTS IDENTIFIER('{results_table}') (
-            file_path STRING,
-            filename STRING,
-            status STRING,
-            extracted_fields STRING,
-            confirmed_fields STRING,
-            uploaded_at TIMESTAMP,
-            confirmed_at TIMESTAMP
-        ) USING DELTA
+        INSERT INTO IDENTIFIER('{results_table}')
+        (file_path, filename, status, confirmed_fields, confirmed_at)
+        VALUES ('{file_path_escaped}', '{filename_escaped}', '{status}', '{fields_json}', current_timestamp())
+        """, '30s')
+    else:
+        execute_sql(f"""
+        INSERT INTO IDENTIFIER('{results_table}')
+        (file_path, filename, status, extracted_fields, uploaded_at)
+        VALUES ('{file_path_escaped}', '{filename_escaped}', '{status}', '{fields_json}', current_timestamp())
         """, '30s')
 
-        # Upsert: delete then insert (simpler than UPDATE for Databricks SQL)
-        execute_sql(f"DELETE FROM IDENTIFIER('{results_table}') WHERE file_path = '{file_path_escaped}'", '30s')
-
-        if status == 'confirmed':
-            execute_sql(f"""
-            INSERT INTO IDENTIFIER('{results_table}')
-            (file_path, filename, status, confirmed_fields, confirmed_at)
-            VALUES ('{file_path_escaped}', '{filename_escaped}', '{status}', '{fields_json}', current_timestamp())
-            """, '30s')
-        else:
-            execute_sql(f"""
-            INSERT INTO IDENTIFIER('{results_table}')
-            (file_path, filename, status, extracted_fields, uploaded_at)
-            VALUES ('{file_path_escaped}', '{filename_escaped}', '{status}', '{fields_json}', current_timestamp())
-            """, '30s')
-
-        print(f"Saved invoice result: {file_path} ({status})")
-    except Exception as e:
-        print(f"Error saving invoice result: {e}")
-        import traceback
-        traceback.print_exc()
+    print(f"Saved invoice result: {file_path} ({status})")
 
 
 # ---------------------------------------------------------------------------
@@ -877,15 +873,11 @@ def get_invoice_queue():
 
         # Check if table exists
         try:
-            result = w.statement_execution.execute_statement(
-                statement=f"""
+            result = execute_sql(f"""
                 SELECT file_path, filename, status, extracted_fields, confirmed_fields, uploaded_at, confirmed_at
                 FROM IDENTIFIER('{results_table}')
                 ORDER BY uploaded_at DESC
-                """,
-                warehouse_id=current_warehouse_id,
-                wait_timeout='30s'
-            )
+                """, '30s', retries=1)
 
             invoices = []
             if result.result and result.result.data_array:
@@ -956,16 +948,12 @@ def export_invoices(export_format: str = Query("csv", alias="format")):
 
     try:
         results_table = get_invoice_results_table()
-        result = w.statement_execution.execute_statement(
-            statement=f"""
+        result = execute_sql(f"""
             SELECT file_path, filename, status, extracted_fields, confirmed_fields,
                    uploaded_at, confirmed_at
             FROM IDENTIFIER('{results_table}')
             ORDER BY confirmed_at DESC NULLS LAST, uploaded_at DESC
-            """,
-            warehouse_id=current_warehouse_id,
-            wait_timeout='30s'
-        )
+            """, '30s', retries=1)
 
         rows = []
         if result.result and result.result.data_array:
