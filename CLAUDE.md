@@ -13,6 +13,9 @@ This is a Databricks AI Functions Document Intelligence Demo - a full-stack appl
 - Multi-page document support with page navigation
 - Delta table storage for processed document data
 - **Batch Job Integration**: Integration with Databricks Asset Bundle workflows for scalable batch processing
+- **Batch-optimized processing**: Multi-file uploads use a single `ai_parse_document` call and a single `ai_query` call with `failOnError => false` for efficient warehouse usage
+- **Processing failure tracking**: Persistent Delta table logging of all failures (upload, parse, extract) with slide-out error panel, retry, and dismiss actions
+- **Rate limiting**: Configurable daily document cap and per-upload file limit via `rate_limits.yaml`
 - Real-time configuration management for warehouse, volume, and table paths
 - Responsive UI with zoom controls and collapsible panels
 - **Automatic cleanup**: Batch mode automatically cleans upload directory before each run
@@ -132,6 +135,8 @@ cd unstructured_workflow
 
 ### Configuration Files
 - `backend/app.yaml`: Databricks App configuration with environment variables
+- `backend/invoice_fields.yaml`: Invoice field definitions for extraction (name, label, description, type)
+- `backend/rate_limits.yaml`: Rate limiting configuration (daily cap, per-upload cap)
 - `frontend/next.config.ts`: Static export configuration for Databricks Apps
 - `frontend/src/lib/api-config.ts`: API client with fallback URL strategy
 - `unstructured_workflow/databricks.yml`: Batch workflow configuration
@@ -157,6 +162,15 @@ cd unstructured_workflow
   - `POST /api/batch-job-status/{run_id}` - Poll job status and task progress
 - **Visualization APIs**:
   - `POST /api/visualize-page` - Generates color-coded bounding box visualizations
+- **Batch Extraction APIs**:
+  - `POST /api/batch-extract-fields` - Extract invoice fields from multiple documents in a single `ai_query` call with `failOnError => false` for partial failure handling
+- **Processing Error APIs**:
+  - `GET /api/processing-errors` - List unresolved processing errors from Delta table
+  - `POST /api/dismiss-error` - Mark an error as resolved
+  - `POST /api/retry-invoice` - Re-run parse + extract for a failed document
+- **Rate Limiting APIs**:
+  - `GET /api/rate-limits` - Current rate limit config and remaining daily quota
+  - `POST /api/reload-rate-limits` - Hot-reload rate_limits.yaml without restart
 - **Static Asset Serving**: Serves Next.js static export files and handles routing
 
 ### Frontend State Management

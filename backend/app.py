@@ -64,8 +64,20 @@ def load_invoice_fields():
         return []
 
 
+def load_rate_limits():
+    defaults = {"max_documents_per_day": 50, "max_files_per_upload": 10}
+    try:
+        with open('rate_limits.yaml', 'r') as f:
+            config = yaml.safe_load(f) or {}
+            return {**defaults, **{k: v for k, v in config.items() if isinstance(v, int)}}
+    except Exception as e:
+        print(f"Warning: Could not load rate_limits.yaml, using defaults: {e}")
+        return defaults
+
+
 YAML_CONFIG = load_yaml_config()
 INVOICE_FIELDS = load_invoice_fields()
+RATE_LIMITS = load_rate_limits()
 
 load_dotenv()
 
@@ -112,9 +124,19 @@ class DeltaTablePathConfigRequest(BaseModel):
 class ExtractFieldsRequest(BaseModel):
     file_path: str
 
+class BatchExtractFieldsRequest(BaseModel):
+    file_paths: List[str]
+
 class ConfirmInvoiceRequest(BaseModel):
     file_path: str
     fields: dict
+
+class DismissErrorRequest(BaseModel):
+    file_path: str
+    stage: str
+
+class RetryInvoiceRequest(BaseModel):
+    file_path: str
 
 # ---------------------------------------------------------------------------
 # Databricks client init
@@ -144,6 +166,11 @@ def get_delta_table_path() -> str:
 
 def get_invoice_results_table() -> str:
     return invoice_results_table or "main.ai_parse_document_demo.ashwin_invoice_results"
+
+def get_processing_errors_table() -> str:
+    """Derive errors table name from the invoice results table."""
+    base = get_invoice_results_table()
+    return base.rsplit('.', 1)[0] + '.processing_errors'
 
 # ---------------------------------------------------------------------------
 # Helper: execute SQL and wait
@@ -184,6 +211,82 @@ def execute_sql(statement: str, wait_timeout: str = '50s', retries: int = 0):
                 continue
             raise
     return result
+
+
+def _log_processing_error(file_path: str, filename: str, stage: str, error_message: str):
+    """Log a processing error to the errors Delta table. Best-effort — never raises."""
+    try:
+        errors_table = get_processing_errors_table()
+        execute_sql(f"""
+        CREATE TABLE IF NOT EXISTS IDENTIFIER('{errors_table}') (
+            file_path STRING,
+            filename STRING,
+            stage STRING,
+            error_message STRING,
+            created_at TIMESTAMP,
+            resolved BOOLEAN
+        ) USING DELTA
+        """, '30s')
+
+        fp_esc = file_path.replace("'", "''")
+        fn_esc = filename.replace("'", "''")
+        err_esc = error_message[:2000].replace("'", "''")
+        stage_esc = stage.replace("'", "''")
+
+        execute_sql(f"""
+        INSERT INTO IDENTIFIER('{errors_table}')
+        (file_path, filename, stage, error_message, created_at, resolved)
+        VALUES ('{fp_esc}', '{fn_esc}', '{stage_esc}', '{err_esc}', current_timestamp(), false)
+        """, '30s')
+        print(f"Logged processing error: {filename} / {stage} / {error_message[:100]}")
+    except Exception as log_err:
+        print(f"Warning: could not log processing error: {log_err}")
+
+
+def _get_daily_document_count() -> int:
+    """Count documents processed in the last 24 hours from the invoice results table."""
+    try:
+        results_table = get_invoice_results_table()
+        result = execute_sql(f"""
+            SELECT COUNT(*) FROM IDENTIFIER('{results_table}')
+            WHERE uploaded_at >= current_timestamp() - INTERVAL 24 HOURS
+            """, '15s', retries=1)
+        if result.result and result.result.data_array:
+            return int(result.result.data_array[0][0] or 0)
+    except Exception as e:
+        # Table may not exist yet — that's fine, count is 0
+        if "TABLE_OR_VIEW_NOT_FOUND" not in str(e) and "does not exist" not in str(e).lower():
+            print(f"Warning: daily count query failed: {e}")
+    return 0
+
+
+def _check_rate_limits(file_count: int):
+    """Raise HTTPException if rate limits would be exceeded. Pass file_count=0 to skip batch check."""
+    max_per_upload = RATE_LIMITS.get("max_files_per_upload", 0)
+    if max_per_upload > 0 and file_count > max_per_upload:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Upload limited to {max_per_upload} files at a time ({file_count} provided). "
+                   f"This limit is configured in rate_limits.yaml."
+        )
+
+    max_per_day = RATE_LIMITS.get("max_documents_per_day", 0)
+    if max_per_day > 0:
+        current_count = _get_daily_document_count()
+        remaining = max_per_day - current_count
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily processing limit reached ({max_per_day} documents per 24 hours). "
+                       f"Try again later or adjust the limit in rate_limits.yaml."
+            )
+        if file_count > remaining:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Only {remaining} of {max_per_day} daily documents remaining, "
+                       f"but {file_count} files were submitted. "
+                       f"Reduce the batch size or try again later."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +344,8 @@ async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
     if not w:
         raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
 
+    _check_rate_limits(len(files))
+
     try:
         uploaded_files = []
         base_path = get_uc_volume_path().rstrip('/')
@@ -293,6 +398,13 @@ async def upload_to_uc(files: List[UploadFile] = FastAPIFile(...)):
             "message": f"Successfully uploaded {len(uploaded_files)} files"
         }
     except Exception as e:
+        for file in files:
+            _log_processing_error(
+                file_path=f"{get_uc_volume_path()}/{file.filename}",
+                filename=file.filename or "unknown",
+                stage="upload",
+                error_message=str(e),
+            )
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
@@ -403,6 +515,8 @@ def write_to_delta_table(request: WriteToTableRequest):
             error_msg = "Processing failed"
             if result.status and result.status.error:
                 error_msg += f": {result.status.error}"
+            for fp in request.file_paths:
+                _log_processing_error(fp, fp.split('/')[-1], "parse", error_msg)
             return {
                 "success": False,
                 "destination_table": destination_table,
@@ -413,6 +527,8 @@ def write_to_delta_table(request: WriteToTableRequest):
 
     except Exception as e:
         print(f"Delta table write error: {e}")
+        for fp in request.file_paths:
+            _log_processing_error(fp, fp.split('/')[-1], "parse", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to write to delta table: {str(e)}")
 
 
@@ -671,6 +787,25 @@ def reload_invoice_fields():
     return {"success": True, "fields": INVOICE_FIELDS, "count": len(INVOICE_FIELDS)}
 
 
+@app.get("/api/rate-limits")
+def get_rate_limits():
+    max_per_day = RATE_LIMITS.get("max_documents_per_day", 0)
+    current_count = _get_daily_document_count() if max_per_day > 0 else 0
+    return {
+        "max_documents_per_day": max_per_day,
+        "max_files_per_upload": RATE_LIMITS.get("max_files_per_upload", 0),
+        "documents_processed_today": current_count,
+        "remaining_today": max(0, max_per_day - current_count) if max_per_day > 0 else None,
+    }
+
+
+@app.post("/api/reload-rate-limits")
+def reload_rate_limits():
+    global RATE_LIMITS
+    RATE_LIMITS = load_rate_limits()
+    return {"success": True, **RATE_LIMITS}
+
+
 # ---------------------------------------------------------------------------
 # Extract Fields (ai_query)
 # ---------------------------------------------------------------------------
@@ -753,14 +888,17 @@ def extract_fields(request: ExtractFieldsRequest):
                         "fields": extracted_fields
                     }
 
+                err = f"Could not parse AI response: {raw_response[:200] if raw_response else 'empty'}"
+                _log_processing_error(file_path, file_path.split('/')[-1], "extract", err)
                 return {
                     "success": False,
                     "file_path": file_path,
                     "fields": {f['name']: None for f in INVOICE_FIELDS},
-                    "error": f"Could not parse AI response: {raw_response[:200] if raw_response else 'empty'}"
+                    "error": err
                 }
             else:
                 print("Extract query succeeded but no data returned")
+                _log_processing_error(file_path, file_path.split('/')[-1], "extract", "No document content found to extract from")
                 return {
                     "success": False,
                     "file_path": file_path,
@@ -774,12 +912,14 @@ def extract_fields(request: ExtractFieldsRequest):
             if result.status.error:
                 error_msg += f": {result.status.error}"
         print(f"Extract fields error: {error_msg}")
+        _log_processing_error(file_path, file_path.split('/')[-1], "extract", error_msg)
         return {"success": False, "file_path": file_path, "fields": {f['name']: None for f in INVOICE_FIELDS}, "error": error_msg}
 
     except Exception as e:
         print(f"Field extraction exception: {e}")
         import traceback
         traceback.print_exc()
+        _log_processing_error(request.file_path, request.file_path.split('/')[-1], "extract", str(e))
         return {
             "success": False,
             "file_path": request.file_path,
@@ -811,6 +951,151 @@ def _parse_ai_response(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
     return None
+
+
+@app.post("/api/batch-extract-fields")
+def batch_extract_fields(request: BatchExtractFieldsRequest):
+    """Extract invoice fields from multiple documents in a single ai_query call.
+
+    Uses failOnError => false so one bad document doesn't kill the batch.
+    Returns per-file results with successes and failures separated.
+    """
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+    if not request.file_paths:
+        return {"success": True, "results": [], "errors": []}
+
+    try:
+        destination_table = get_delta_table_path()
+
+        # Build dbfs paths
+        dbfs_paths = []
+        path_map = {}  # dbfs_path -> original file_path
+        for fp in request.file_paths:
+            dbfs = f"dbfs:{fp}" if fp.startswith('/Volumes/') else fp
+            dbfs_paths.append(dbfs)
+            path_map[dbfs] = fp
+
+        path_filter = ", ".join([f"'{p.replace(chr(39), chr(39)+chr(39))}'" for p in dbfs_paths])
+
+        # Build prompt (same as single-file version)
+        field_lines = []
+        for f in INVOICE_FIELDS:
+            desc = f['description'].replace("'", "''")
+            field_lines.append(f"- {f['name']}: {desc}")
+        field_descriptions_escaped = "\\n".join(field_lines)
+        field_names_escaped = ", ".join([f['name'] for f in INVOICE_FIELDS])
+
+        prompt_sql = (
+            "You are extracting structured data from an invoice document. "
+            "Extract ONLY the following fields from the document text below. "
+            "Return a JSON object with exactly these keys. If a value cannot be found, use null.\\n\\n"
+            f"Fields to extract:\\n{field_descriptions_escaped}\\n\\n"
+            "IMPORTANT:\\n"
+            "- Return ONLY a valid JSON object, no other text or markdown.\\n"
+            f"- Use the exact field names as keys: {field_names_escaped}\\n"
+            "- For dates, use YYYY-MM-DD format when possible.\\n"
+            "- For currency amounts, return just the number (e.g. 1234.56 not $1,234.56).\\n\\n"
+            "Document text:\\n"
+        )
+
+        batch_query = f"""
+        WITH doc_content AS (
+            SELECT path, concat_ws('\\n', collect_list(content)) as full_text
+            FROM IDENTIFIER('{destination_table}')
+            WHERE path IN ({path_filter})
+            AND content IS NOT NULL
+            AND type IN ('text', 'title', 'section_header', 'table', 'page_header', 'page_footer')
+            GROUP BY path
+        )
+        SELECT
+            path,
+            ai_query(
+                '{ai_query_model}',
+                concat('{prompt_sql}', full_text),
+                failOnError => false
+            ) as ai_response
+        FROM doc_content
+        WHERE full_text IS NOT NULL
+        """
+
+        print(f"Batch extracting fields for {len(request.file_paths)} files using {ai_query_model}")
+        result = execute_sql(batch_query, retries=2)
+
+        if not (result.status and result.status.state == StatementState.SUCCEEDED):
+            error_msg = "Batch extraction query failed"
+            if result.status and result.status.error:
+                error_msg += f": {result.status.error}"
+            for fp in request.file_paths:
+                _log_processing_error(fp, fp.split('/')[-1], "extract", error_msg)
+            return {"success": False, "results": [], "errors": [
+                {"file_path": fp, "error": error_msg} for fp in request.file_paths
+            ]}
+
+        # Parse results — each row is (path, ai_response_struct)
+        # ai_response with failOnError=false returns a STRUCT rendered as JSON: {"response": "...", "error": "..."}
+        successes = []
+        errors = []
+        seen_paths = set()
+
+        if result.result and result.result.data_array:
+            for row in result.result.data_array:
+                dbfs_path = row[0]
+                original_path = path_map.get(dbfs_path, dbfs_path)
+                filename = original_path.split('/')[-1]
+                seen_paths.add(dbfs_path)
+
+                raw_ai = row[1]
+
+                # Parse the failOnError struct — comes back as JSON string
+                ai_response = None
+                ai_error = None
+                if raw_ai:
+                    try:
+                        struct = json.loads(raw_ai) if isinstance(raw_ai, str) else raw_ai
+                        ai_response = struct.get("response")
+                        ai_error = struct.get("error")
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        # Might be a plain string response (non-struct)
+                        ai_response = raw_ai
+
+                if ai_error:
+                    _log_processing_error(original_path, filename, "extract", ai_error)
+                    errors.append({"file_path": original_path, "error": ai_error})
+                    continue
+
+                extracted_fields = _parse_ai_response(ai_response)
+                if extracted_fields:
+                    try:
+                        _save_invoice_result(original_path, extracted_fields, status='extracted')
+                    except Exception as save_err:
+                        print(f"Warning: could not save extraction result for {filename}: {save_err}")
+                    successes.append({"file_path": original_path, "fields": extracted_fields})
+                else:
+                    err = f"Could not parse AI response: {str(ai_response)[:200] if ai_response else 'empty'}"
+                    _log_processing_error(original_path, filename, "extract", err)
+                    errors.append({"file_path": original_path, "error": err})
+
+        # Any paths not in result = no content found
+        for dbfs_path, original_path in path_map.items():
+            if dbfs_path not in seen_paths:
+                err = "No document content found to extract from"
+                _log_processing_error(original_path, original_path.split('/')[-1], "extract", err)
+                errors.append({"file_path": original_path, "error": err})
+
+        return {"success": True, "results": successes, "errors": errors}
+
+    except Exception as e:
+        print(f"Batch extraction exception: {e}")
+        import traceback
+        traceback.print_exc()
+        for fp in request.file_paths:
+            _log_processing_error(fp, fp.split('/')[-1], "extract", str(e))
+        return {"success": False, "results": [], "errors": [
+            {"file_path": fp, "error": str(e)} for fp in request.file_paths
+        ]}
 
 
 def _save_invoice_result(file_path: str, fields: dict, status: str = 'extracted'):
@@ -1059,6 +1344,117 @@ def export_invoices(export_format: str = Query("csv", alias="format")):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Processing Errors
+# ---------------------------------------------------------------------------
+
+@app.get("/api/processing-errors")
+def get_processing_errors():
+    """Return unresolved processing errors."""
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+
+    try:
+        errors_table = get_processing_errors_table()
+        try:
+            result = execute_sql(f"""
+                SELECT file_path, filename, stage, error_message, created_at
+                FROM IDENTIFIER('{errors_table}')
+                WHERE resolved = false
+                ORDER BY created_at DESC
+                """, '30s', retries=1)
+
+            errors = []
+            if result.result and result.result.data_array:
+                for row in result.result.data_array:
+                    errors.append({
+                        "file_path": row[0],
+                        "filename": row[1],
+                        "stage": row[2],
+                        "error_message": row[3],
+                        "created_at": row[4],
+                    })
+            return {"success": True, "errors": errors}
+        except Exception as e:
+            if "TABLE_OR_VIEW_NOT_FOUND" in str(e) or "does not exist" in str(e).lower():
+                return {"success": True, "errors": []}
+            raise
+
+    except Exception as e:
+        print(f"Processing errors query failed: {e}")
+        return {"success": False, "errors": [], "error": str(e)}
+
+
+@app.post("/api/dismiss-error")
+def dismiss_error(request: DismissErrorRequest):
+    """Mark errors for a given file_path + stage as resolved."""
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+
+    try:
+        errors_table = get_processing_errors_table()
+        fp_esc = request.file_path.replace("'", "''")
+        stage_esc = request.stage.replace("'", "''")
+        execute_sql(f"""
+            UPDATE IDENTIFIER('{errors_table}')
+            SET resolved = true
+            WHERE file_path = '{fp_esc}' AND stage = '{stage_esc}' AND resolved = false
+            """, '30s')
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to dismiss error: {str(e)}")
+
+
+@app.post("/api/retry-invoice")
+def retry_invoice(request: RetryInvoiceRequest):
+    """Re-run parse + extract for a previously failed invoice.
+
+    Resolves existing errors for the file and kicks off processing again.
+    """
+    if not w:
+        raise HTTPException(status_code=500, detail="Databricks connection is not configured.")
+    if not current_warehouse_id:
+        raise HTTPException(status_code=500, detail="DATABRICKS_WAREHOUSE_ID is not set.")
+
+    file_path = request.file_path
+
+    # Resolve any existing errors for this file
+    try:
+        errors_table = get_processing_errors_table()
+        fp_esc = file_path.replace("'", "''")
+        execute_sql(f"""
+            UPDATE IDENTIFIER('{errors_table}')
+            SET resolved = true
+            WHERE file_path = '{fp_esc}' AND resolved = false
+            """, '30s')
+    except Exception:
+        pass  # Table may not exist yet — that's fine
+
+    # Re-run parse
+    try:
+        parse_req = WriteToTableRequest(file_paths=[file_path])
+        parse_result = write_to_delta_table(parse_req)
+        if not parse_result.get("success"):
+            return {"success": False, "stage": "parse", "error": parse_result.get("message", "Parse failed")}
+    except HTTPException as he:
+        return {"success": False, "stage": "parse", "error": he.detail}
+    except Exception as e:
+        return {"success": False, "stage": "parse", "error": str(e)}
+
+    # Re-run extract
+    try:
+        extract_req = ExtractFieldsRequest(file_path=file_path)
+        extract_result = extract_fields(extract_req)
+        if not extract_result.get("success"):
+            return {"success": False, "stage": "extract", "error": extract_result.get("error", "Extract failed")}
+    except Exception as e:
+        return {"success": False, "stage": "extract", "error": str(e)}
+
+    return {"success": True, "file_path": file_path, "fields": extract_result.get("fields", {})}
 
 
 # ---------------------------------------------------------------------------

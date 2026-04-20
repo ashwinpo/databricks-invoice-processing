@@ -1,0 +1,11 @@
+# Rate-limit configuration — edit this file to control processing volume.
+#
+# max_documents_per_day:  Total documents that can be processed (parse + extract) in a
+#                         rolling 24-hour window.  Set to 0 to disable the daily cap.
+# max_files_per_upload:   Maximum number of files accepted in a single upload request.
+#                         Prevents accidental bulk uploads.  Set to 0 to disable.
+#
+# Changes take effect on next request (no restart needed if using /api/reload-rate-limits).
+
+max_documents_per_day: 50
+max_files_per_upload: 10

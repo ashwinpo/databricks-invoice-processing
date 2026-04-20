@@ -31,6 +31,8 @@ import {
   Settings,
   X,
   Download,
+  AlertTriangle,
+  RotateCcw,
 } from "lucide-react";
 import { apiCall, getBaseUrl } from "@/lib/api-config";
 
@@ -57,6 +59,14 @@ interface Invoice {
   ucPath?: string;
 }
 
+interface ProcessingError {
+  file_path: string;
+  filename: string;
+  stage: string;
+  error_message: string;
+  created_at: string;
+}
+
 // ---------------------------------------------------------------------------
 // Main Page
 // ---------------------------------------------------------------------------
@@ -74,6 +84,15 @@ export default function InvoiceProcessingPage() {
   const [zoom, setZoom] = useState(100);
   const [confirmLoading, setConfirmLoading] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [processingErrors, setProcessingErrors] = useState<ProcessingError[]>([]);
+  const [retryingPaths, setRetryingPaths] = useState<Set<string>>(new Set());
+  const [showErrorsPanel, setShowErrorsPanel] = useState(false);
+  const [rateLimits, setRateLimits] = useState<{
+    max_documents_per_day: number;
+    max_files_per_upload: number;
+    remaining_today: number | null;
+  } | null>(null);
+  const [rateLimitError, setRateLimitError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Load field config on mount + invoice queue
@@ -83,6 +102,8 @@ export default function InvoiceProcessingPage() {
     }).catch(console.error);
 
     loadQueue();
+    loadErrors();
+    loadRateLimits();
   }, []);
 
   const loadQueue = async () => {
@@ -104,6 +125,84 @@ export default function InvoiceProcessingPage() {
     }
   };
 
+  const loadRateLimits = async () => {
+    try {
+      const res = await apiCall("/api/rate-limits");
+      setRateLimits(res);
+    } catch {
+      // Non-critical
+    }
+  };
+
+  const loadErrors = async () => {
+    try {
+      const res = await apiCall("/api/processing-errors");
+      if (res.success && res.errors) {
+        setProcessingErrors(res.errors);
+        if (res.errors.length === 0) setShowErrorsPanel(false);
+      }
+    } catch (e) {
+      console.error("Failed to load processing errors:", e);
+    }
+  };
+
+  const handleRetry = async (filePath: string) => {
+    setRetryingPaths((prev) => new Set(prev).add(filePath));
+    try {
+      const res = await apiCall("/api/retry-invoice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_path: filePath }),
+      });
+      if (res.success && res.fields) {
+        // Update the invoice in the queue with new extracted fields
+        setInvoices((prev) => {
+          const exists = prev.some((i) => i.file_path === filePath);
+          if (exists) {
+            return prev.map((i) =>
+              i.file_path === filePath
+                ? { ...i, status: "extracted" as const, extracted_fields: res.fields, error: undefined }
+                : i
+            );
+          }
+          return [
+            {
+              file_path: filePath,
+              filename: filePath.split("/").pop() || filePath,
+              status: "extracted" as const,
+              extracted_fields: res.fields,
+              confirmed_fields: null,
+            },
+            ...prev,
+          ];
+        });
+      }
+      // Reload errors and queue regardless of result
+      await Promise.all([loadErrors(), loadQueue()]);
+    } catch (e) {
+      console.error("Retry failed:", e);
+    } finally {
+      setRetryingPaths((prev) => {
+        const next = new Set(prev);
+        next.delete(filePath);
+        return next;
+      });
+    }
+  };
+
+  const handleDismissError = async (filePath: string, stage: string) => {
+    try {
+      await apiCall("/api/dismiss-error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_path: filePath, stage }),
+      });
+      await loadErrors();
+    } catch (e) {
+      console.error("Dismiss error failed:", e);
+    }
+  };
+
   // -------------------------------------------------------------------------
   // Upload & Process
   // -------------------------------------------------------------------------
@@ -118,9 +217,7 @@ export default function InvoiceProcessingPage() {
     // Reset input so same files can be selected again
     e.target.value = "";
 
-    for (const file of fileArray) {
-      await processOneInvoice(file);
-    }
+    await uploadAndProcessBatch(fileArray);
   };
 
   const handleDrop = async (e: React.DragEvent) => {
@@ -128,128 +225,197 @@ export default function InvoiceProcessingPage() {
     const files = Array.from(e.dataTransfer.files).filter(
       (f) => f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")
     );
-    for (const file of files) {
-      await processOneInvoice(file);
-    }
+    if (files.length > 0) await uploadAndProcessBatch(files);
   };
 
-  const processOneInvoice = async (file: File) => {
-    const tempPath = `__pending__/${file.name}`;
-    const newInvoice: Invoice = {
-      file_path: tempPath,
-      filename: file.name,
-      status: "uploading",
-      extracted_fields: null,
-      confirmed_fields: null,
+  const uploadAndProcessBatch = async (files: File[]) => {
+    setRateLimitError(null);
+
+    // Step 1: Add all files to the queue immediately so the user sees them
+    const pending: { file: File; tempPath: string }[] = files.map((file) => ({
       file,
-    };
+      tempPath: `__pending__/${file.name}`,
+    }));
 
-    setInvoices((prev) => [newInvoice, ...prev]);
+    setInvoices((prev) => [
+      ...pending.map(({ file, tempPath }) => ({
+        file_path: tempPath,
+        filename: file.name,
+        status: "uploading" as const,
+        extracted_fields: null,
+        confirmed_fields: null,
+        file,
+      })),
+      ...prev,
+    ]);
 
-    try {
-      // Step 1: Upload
-      const formData = new FormData();
+    // Step 2: Upload all files in one batch request
+    const formData = new FormData();
+    for (const { file } of pending) {
       formData.append("files", file);
-      const uploadRes = await apiCall("/api/upload-to-uc", { method: "POST", body: formData });
-      const ucPath = uploadRes.uploaded_files?.[0]?.path;
-      if (!ucPath) throw new Error("Upload failed — no path returned");
+    }
 
-      setInvoices((prev) =>
-        prev.map((inv) =>
-          inv.file_path === tempPath
-            ? { ...inv, file_path: ucPath, ucPath, status: "parsing" }
-            : inv
-        )
-      );
-
-      // Step 2: Parse (ai_parse_document) — fire and poll
-      apiCall("/api/write-to-delta-table", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_paths: [ucPath] }),
-      }).catch(() => {});
-
-      // Poll until parsed
-      let parsed = false;
-      for (let attempt = 0; attempt < 60; attempt++) {
-        await sleep(5000);
-        try {
-          const queryRes = await apiCall("/api/query-delta-table", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ file_paths: [ucPath] }),
-          });
-          if (queryRes.success && queryRes.data && queryRes.data.length > 0) {
-            parsed = true;
-            break;
-          }
-        } catch {
-          // Keep polling
+    let uploadedFiles: { name: string; path: string }[];
+    try {
+      const uploadRes = await apiCall("/api/upload-to-uc", { method: "POST", body: formData }).catch((err) => {
+        if (err?.message?.includes("429") || err?.message?.includes("limit")) {
+          const detail = err?.message || "Rate limit exceeded";
+          setRateLimitError(detail);
+          throw new Error(detail);
         }
-      }
-
-      if (!parsed) throw new Error("Document parsing timed out");
-
-      setInvoices((prev) =>
-        prev.map((inv) =>
-          inv.file_path === ucPath ? { ...inv, status: "extracting" } : inv
-        )
-      );
-
-      // Step 3: Extract fields (retry up to 3 times for timeouts)
-      let extractRes = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          extractRes = await apiCall("/api/extract-fields", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ file_path: ucPath }),
-          });
-          if (extractRes.success) break;
-        } catch (e) {
-          console.warn(`Extract attempt ${attempt + 1}/3 failed:`, e);
-          if (attempt < 2) await sleep(5000 * (attempt + 1));
-        }
-      }
-
-      if (extractRes?.success && extractRes.fields) {
-        setInvoices((prev) =>
-          prev.map((inv) =>
-            inv.file_path === ucPath
-              ? { ...inv, status: "extracted", extracted_fields: extractRes.fields }
-              : inv
-          )
-        );
-      } else {
-        // Extraction failed but document is parsed — still let user review manually
-        const errorDetail = extractRes?.error || "Field extraction failed after retries";
-        console.error("Extract fields error:", errorDetail);
-        setInvoices((prev) =>
-          prev.map((inv) =>
-            inv.file_path === ucPath
-              ? {
-                  ...inv,
-                  status: "extracted",
-                  extracted_fields: extractRes?.fields || {},
-                  error: errorDetail,
-                }
-              : inv
-          )
-        );
-      }
-
-      // Refresh queue from server
-      loadQueue();
+        throw err;
+      });
+      uploadedFiles = uploadRes.uploaded_files || [];
     } catch (err: any) {
       const errMsg = err?.message || String(err);
       setInvoices((prev) =>
         prev.map((inv) =>
-          inv.file_path === tempPath || inv.filename === file.name
+          inv.file_path.startsWith("__pending__/")
             ? { ...inv, status: "error", error: errMsg }
             : inv
         )
       );
+      loadErrors();
+      loadRateLimits();
+      return;
     }
+
+    // Map uploaded paths back to pending entries by index (order is preserved).
+    // Can't match by name because the backend may rename duplicates (e.g. file_1.pdf).
+    const uploaded: { tempPath: string; ucPath: string; filename: string }[] = [];
+    for (let i = 0; i < pending.length; i++) {
+      const uf = uploadedFiles[i];
+      if (uf?.path) {
+        uploaded.push({ tempPath: pending[i].tempPath, ucPath: uf.path, filename: uf.name });
+      }
+    }
+
+    const allUcPaths = uploaded.map((u) => u.ucPath);
+
+    // Step 3: Parse ALL files in one ai_parse_document call
+    setInvoices((prev) =>
+      prev.map((inv) => {
+        const match = uploaded.find((u) => u.tempPath === inv.file_path);
+        return match
+          ? { ...inv, file_path: match.ucPath, ucPath: match.ucPath, status: "parsing" as const }
+          : inv;
+      })
+    );
+
+    loadRateLimits();
+
+    // Fire single parse request for all files
+    apiCall("/api/write-to-delta-table", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_paths: allUcPaths }),
+    }).catch(() => {});
+
+    // Poll until ALL files are parsed
+    let allParsed = false;
+    for (let attempt = 0; attempt < 90; attempt++) {
+      await sleep(5000);
+      try {
+        const queryRes = await apiCall("/api/query-delta-table", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_paths: allUcPaths }),
+        });
+        if (queryRes.success && queryRes.data) {
+          // Check that we have results for every file
+          const parsedPaths = new Set(queryRes.data.map((d: any) => d.path));
+          const allFound = allUcPaths.every((p) => {
+            const dbfs = p.startsWith("/Volumes/") ? `dbfs:${p}` : p;
+            return parsedPaths.has(dbfs);
+          });
+          if (allFound) {
+            allParsed = true;
+            break;
+          }
+        }
+      } catch {
+        // Keep polling
+      }
+    }
+
+    if (!allParsed) {
+      setInvoices((prev) =>
+        prev.map((inv) =>
+          allUcPaths.includes(inv.file_path) && inv.status === "parsing"
+            ? { ...inv, status: "error", error: "Document parsing timed out" }
+            : inv
+        )
+      );
+      loadErrors();
+      loadRateLimits();
+      return;
+    }
+
+    // Step 4: Extract ALL fields in one ai_query call
+    setInvoices((prev) =>
+      prev.map((inv) =>
+        allUcPaths.includes(inv.file_path)
+          ? { ...inv, status: "extracting" }
+          : inv
+      )
+    );
+
+    let batchExtractRes = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        batchExtractRes = await apiCall("/api/batch-extract-fields", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_paths: allUcPaths }),
+        });
+        if (batchExtractRes.success) break;
+      } catch (e) {
+        console.warn(`Batch extract attempt ${attempt + 1}/3 failed:`, e);
+        if (attempt < 2) await sleep(5000 * (attempt + 1));
+      }
+    }
+
+    if (batchExtractRes?.success) {
+      // Apply successes
+      const successMap = new Map(
+        (batchExtractRes.results || []).map((r: any) => [r.file_path, r.fields])
+      );
+      const errorMap = new Map(
+        (batchExtractRes.errors || []).map((e: any) => [e.file_path, e.error])
+      );
+
+      setInvoices((prev) =>
+        prev.map((inv) => {
+          if (!allUcPaths.includes(inv.file_path)) return inv;
+          const fields = successMap.get(inv.file_path);
+          const error = errorMap.get(inv.file_path);
+          if (fields) {
+            return { ...inv, status: "extracted" as const, extracted_fields: fields };
+          }
+          // Extraction error but doc is parsed — let user review manually
+          return {
+            ...inv,
+            status: "extracted" as const,
+            extracted_fields: {},
+            error: error || "Field extraction failed",
+          };
+        })
+      );
+    } else {
+      // Total failure — mark all as extracted with empty fields for manual review
+      const errMsg = batchExtractRes?.errors?.[0]?.error || "Batch extraction failed";
+      setInvoices((prev) =>
+        prev.map((inv) =>
+          allUcPaths.includes(inv.file_path)
+            ? { ...inv, status: "extracted" as const, extracted_fields: {}, error: errMsg }
+            : inv
+        )
+      );
+    }
+
+    loadQueue();
+    loadErrors();
+    loadRateLimits();
   };
 
   // -------------------------------------------------------------------------
@@ -403,6 +569,7 @@ export default function InvoiceProcessingPage() {
   const processingCount = invoices.filter((i) =>
     ["uploading", "parsing", "extracting"].includes(i.status)
   ).length;
+  const errorCount = processingErrors.length;
 
   if (view === "review") {
     const inv = invoices[activeIndex];
@@ -571,6 +738,11 @@ export default function InvoiceProcessingPage() {
           </div>
           <div className="flex items-center gap-3">
             <div className="flex gap-2 text-xs">
+              {errorCount > 0 && (
+                <span className="px-2 py-1 bg-red-100 text-red-700 rounded-full">
+                  {errorCount} failed
+                </span>
+              )}
               {processingCount > 0 && (
                 <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-full">
                   {processingCount} processing
@@ -608,6 +780,20 @@ export default function InvoiceProcessingPage() {
         {/* Settings panel */}
         {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
 
+        {/* Rate limit warning */}
+        {rateLimitError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 flex items-start gap-3">
+            <AlertTriangle className="h-5 w-5 text-red-500 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-red-800">Rate limit reached</p>
+              <p className="text-xs text-red-600 mt-0.5">{rateLimitError}</p>
+            </div>
+            <button onClick={() => setRateLimitError(null)} className="ml-auto text-red-400 hover:text-red-600">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
         {/* Upload area */}
         <Card>
           <CardContent className="pt-6">
@@ -624,6 +810,12 @@ export default function InvoiceProcessingPage() {
               <p className="text-xs text-gray-400 mt-1">
                 Files will be uploaded, parsed, and queued for review automatically
               </p>
+              {rateLimits && rateLimits.remaining_today !== null && (
+                <p className={`text-xs mt-2 ${rateLimits.remaining_today <= 5 ? "text-orange-500 font-medium" : "text-gray-400"}`}>
+                  {rateLimits.remaining_today} of {rateLimits.max_documents_per_day} daily documents remaining
+                  {rateLimits.max_files_per_upload > 0 && ` · max ${rateLimits.max_files_per_upload} per upload`}
+                </p>
+              )}
               <input
                 ref={fileInputRef}
                 type="file"
@@ -635,6 +827,20 @@ export default function InvoiceProcessingPage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Processing errors — compact banner */}
+        {processingErrors.length > 0 && !showErrorsPanel && (
+          <button
+            onClick={() => setShowErrorsPanel(true)}
+            className="w-full bg-red-50 border border-red-200 rounded-lg px-4 py-3 flex items-center gap-3 hover:bg-red-100 transition-colors text-left"
+          >
+            <AlertTriangle className="h-4 w-4 text-red-500 shrink-0" />
+            <span className="text-sm font-medium text-red-800">
+              {processingErrors.length} processing {processingErrors.length === 1 ? "failure" : "failures"}
+            </span>
+            <span className="text-xs text-red-500 ml-auto">View details</span>
+          </button>
+        )}
 
         {/* Queue table */}
         {invoices.length > 0 && (
@@ -706,6 +912,74 @@ export default function InvoiceProcessingPage() {
           </div>
         )}
       </div>
+
+      {/* Errors slide-out panel */}
+      {showErrorsPanel && (
+        <div className="fixed inset-0 z-50 flex justify-end">
+          <div className="absolute inset-0 bg-black/20" onClick={() => setShowErrorsPanel(false)} />
+          <div className="relative w-full max-w-lg bg-white shadow-xl flex flex-col">
+            <div className="px-4 py-3 border-b flex items-center justify-between shrink-0">
+              <h2 className="text-sm font-semibold text-red-800 flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4" />
+                Processing Failures ({processingErrors.length})
+              </h2>
+              <Button variant="ghost" size="sm" onClick={() => setShowErrorsPanel(false)}>
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            <div className="flex-1 overflow-auto">
+              {processingErrors.length === 0 ? (
+                <div className="text-center py-12 text-gray-400 text-sm">No failures</div>
+              ) : (
+                <div className="divide-y">
+                  {processingErrors.map((err, idx) => (
+                    <div key={err.file_path + err.stage + idx} className="px-4 py-3 hover:bg-red-50/50">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <FileText className="h-4 w-4 text-red-400 shrink-0" />
+                            <span className="text-sm font-medium truncate">{err.filename}</span>
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-700 shrink-0">
+                              {err.stage}
+                            </span>
+                          </div>
+                          <p className="text-xs text-gray-500 mt-1 line-clamp-2" title={err.error_message}>
+                            {err.error_message}
+                          </p>
+                          <p className="text-[10px] text-gray-400 mt-1">
+                            {err.created_at ? new Date(err.created_at).toLocaleString() : ""}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={retryingPaths.has(err.file_path)}
+                            onClick={() => handleRetry(err.file_path)}
+                          >
+                            {retryingPaths.has(err.file_path) ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <RotateCcw className="h-3 w-3" />
+                            )}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => handleDismissError(err.file_path, err.stage)}
+                          >
+                            <X className="h-3 w-3" />
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
