@@ -12,8 +12,6 @@ env:
   value: 862f1d757f0424f7
 - name: STATIC_FILES_PATH
   value: /Workspace/Users/ashwin.pothukuchi@databricks.com/databricks_apps/ai-parse-document-demo/static
-- name: NEXT_PUBLIC_API_URL
-  value: https://e2-demo-field-eng.cloud.databricks.com:8000
 - name: DATABRICKS_VOLUME_PATH
   value: /Volumes/main/ai_parse_document_demo/ashwin_invoice_demo/
 - name: DATABRICKS_DELTA_TABLE_PATH
