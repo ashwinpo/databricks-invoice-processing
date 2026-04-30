@@ -304,45 +304,25 @@ export default function InvoiceProcessingPage() {
 
     loadRateLimits();
 
-    // Fire single parse request for all files
-    apiCall("/api/write-to-delta-table", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file_paths: allUcPaths }),
-    }).catch(() => {});
-
-    // Poll until ALL files are parsed
-    let allParsed = false;
-    for (let attempt = 0; attempt < 90; attempt++) {
-      await sleep(5000);
-      try {
-        const queryRes = await apiCall("/api/query-delta-table", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ file_paths: allUcPaths }),
-        });
-        if (queryRes.success && queryRes.data) {
-          // Check that we have results for every file
-          const parsedPaths = new Set(queryRes.data.map((d: any) => d.path));
-          const allFound = allUcPaths.every((p) => {
-            const dbfs = p.startsWith("/Volumes/") ? `dbfs:${p}` : p;
-            return parsedPaths.has(dbfs);
-          });
-          if (allFound) {
-            allParsed = true;
-            break;
-          }
-        }
-      } catch {
-        // Keep polling
-      }
+    // Await parse completion — do NOT fire-and-forget, as the backend DELETEs
+    // then INSERTs data; polling during that window finds stale/empty results.
+    let parseSuccess = false;
+    try {
+      const parseRes = await apiCall("/api/write-to-delta-table", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_paths: allUcPaths }),
+      });
+      parseSuccess = parseRes?.success === true;
+    } catch (e) {
+      console.error("Parse request failed:", e);
     }
 
-    if (!allParsed) {
+    if (!parseSuccess) {
       setInvoices((prev) =>
         prev.map((inv) =>
           allUcPaths.includes(inv.file_path) && inv.status === "parsing"
-            ? { ...inv, status: "error", error: "Document parsing timed out" }
+            ? { ...inv, status: "error", error: "Document parsing failed" }
             : inv
         )
       );
