@@ -81,6 +81,7 @@ display(pdf_df.select("path", "length"))
 # COMMAND ----------
 
 # Parse documents and extract text content
+# ai_parse_document returns a VARIANT — use variant_explode and :: cast syntax
 content_df = spark.sql(f"""
     WITH parsed AS (
         SELECT
@@ -91,24 +92,17 @@ content_df = spark.sql(f"""
     exploded AS (
         SELECT
             path,
-            posexplode(parsed.pages) AS (page_idx, page)
-        FROM parsed
-    ),
-    elements AS (
-        SELECT
-            path,
-            page_idx,
-            element.type AS element_type,
-            element.content AS content
-        FROM exploded
-        LATERAL VIEW explode(page.elements) AS element
-        WHERE element.type IN ('text', 'title', 'section_header', 'table', 'page_header', 'page_footer')
+            elem:type::STRING AS elem_type,
+            elem:content::STRING AS content
+        FROM parsed,
+        LATERAL VARIANT_EXPLODE(parsed:document:elements) AS (pos, key, elem)
     )
     SELECT
         path,
         concat_ws('\\n', collect_list(content)) AS full_text
-    FROM elements
+    FROM exploded
     WHERE content IS NOT NULL
+    AND elem_type IN ('text', 'title', 'section_header', 'table', 'page_header', 'page_footer')
     GROUP BY path
 """)
 
@@ -125,19 +119,24 @@ print(f"Parsed {content_df.count()} document(s)")
 content_df.createOrReplaceTempView("content_view")
 
 EXTRACTION_PROMPT = (
-    "Extract these fields from the invoice text as JSON. Return ONLY valid JSON, no explanation.\\n\\n"
-    "Fields to extract:\\n"
-    "- vendor_name: The vendor/supplier company name that issued this invoice\\n"
-    "- vendor_address: The vendor street address (not bill-to or ship-to)\\n"
-    "- vendor_city: The vendor city\\n"
-    "- vendor_state: The vendor state abbreviation\\n"
-    "- invoice_number: The unique invoice identifier\\n"
-    "- invoice_date: The date the invoice was issued (YYYY-MM-DD format)\\n"
-    "- invoice_total: The total amount due as a number (no currency symbols)\\n"
-    "- po_number: The purchase order number if present (null if not found)\\n\\n"
-    "Invoice text:\\n"
+    "Extract these fields from the document text below. "
+    "Return ONLY a valid JSON object with no other text, no markdown.\\n\\n"
+    '{"vendor_name": "...", "vendor_address": "...", "vendor_city": "...", '
+    '"vendor_state": "...", "invoice_number": "...", "invoice_date": "YYYY-MM-DD", '
+    '"invoice_total": 0.00, "po_number": "..."}\\n\\n'
+    "Rules:\\n"
+    "- vendor_name: The company that issued/sent this invoice (not the bill-to/customer)\\n"
+    "- vendor_address: The issuing vendor street address\\n"
+    "- vendor_city/vendor_state: Vendor location\\n"
+    "- invoice_date: Issue date in YYYY-MM-DD\\n"
+    "- invoice_total: Total amount due as a number\\n"
+    "- po_number: Purchase order number or null\\n"
+    "- If a field is not found, use null\\n\\n"
+    "Document text:\\n"
 )
 
+# ai_query returns STRUCT<result, errorMessage> (not response/error)
+# The LLM may wrap JSON in ```json``` fences — we strip those in Step 3
 extracted_df = spark.sql(f"""
     SELECT
         path,
@@ -145,14 +144,13 @@ extracted_df = spark.sql(f"""
         ai_query(
             '{AI_MODEL}',
             concat('{EXTRACTION_PROMPT}', full_text),
-            responseFormat => '{{"type":"json_object"}}',
             failOnError => false
         ) AS ai_response
     FROM content_view
 """)
 
 extracted_df.createOrReplaceTempView("extracted_view")
-display(spark.sql("SELECT path, ai_response.response, ai_response.error FROM extracted_view"))
+display(spark.sql("SELECT path, ai_response.result, ai_response.errorMessage FROM extracted_view"))
 
 # COMMAND ----------
 
@@ -162,20 +160,29 @@ display(spark.sql("SELECT path, ai_response.response, ai_response.error FROM ext
 # COMMAND ----------
 
 # Parse the JSON responses into structured columns
+# ai_query returns STRUCT<result STRING, errorMessage STRING>
+# Strip markdown code fences (```json ... ```) that the LLM may add
 parsed_extractions = spark.sql("""
+    WITH cleaned AS (
+        SELECT
+            path,
+            regexp_replace(ai_response.result, '```json\\\\n?|```\\\\n?', '') AS clean_json,
+            ai_response.errorMessage AS extraction_error
+        FROM extracted_view
+        WHERE ai_response.errorMessage IS NULL
+    )
     SELECT
         path,
-        get_json_object(ai_response.response, '$.vendor_name') AS vendor_name,
-        get_json_object(ai_response.response, '$.vendor_address') AS vendor_address,
-        get_json_object(ai_response.response, '$.vendor_city') AS vendor_city,
-        get_json_object(ai_response.response, '$.vendor_state') AS vendor_state,
-        get_json_object(ai_response.response, '$.invoice_number') AS invoice_number,
-        get_json_object(ai_response.response, '$.invoice_date') AS invoice_date,
-        CAST(get_json_object(ai_response.response, '$.invoice_total') AS DOUBLE) AS invoice_total,
-        get_json_object(ai_response.response, '$.po_number') AS po_number,
-        ai_response.error AS extraction_error
-    FROM extracted_view
-    WHERE ai_response.error IS NULL
+        get_json_object(clean_json, '$.vendor_name') AS vendor_name,
+        get_json_object(clean_json, '$.vendor_address') AS vendor_address,
+        get_json_object(clean_json, '$.vendor_city') AS vendor_city,
+        get_json_object(clean_json, '$.vendor_state') AS vendor_state,
+        get_json_object(clean_json, '$.invoice_number') AS invoice_number,
+        get_json_object(clean_json, '$.invoice_date') AS invoice_date,
+        CAST(get_json_object(clean_json, '$.invoice_total') AS DOUBLE) AS invoice_total,
+        get_json_object(clean_json, '$.po_number') AS po_number,
+        extraction_error
+    FROM cleaned
 """)
 
 parsed_extractions.createOrReplaceTempView("invoice_extractions")
