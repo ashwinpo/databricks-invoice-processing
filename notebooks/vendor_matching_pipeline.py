@@ -85,7 +85,7 @@ content_df = spark.sql(f"""
     WITH parsed AS (
         SELECT
             path,
-            ai_parse_document(content, 'v2.0', true) AS parsed
+            ai_parse_document(content) AS parsed
         FROM read_files('{VOLUME_PATH}', format => 'binaryFile', pathGlobFilter => '*.pdf')
     ),
     exploded AS (
